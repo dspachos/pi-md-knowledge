@@ -1,35 +1,43 @@
 /**
- * Codebase scanner — walks the file tree, reads files, classifies them,
- * groups them into logical knowledge-base entries, and extracts
- * MEANINGFUL knowledge from the source code.
+ * AI-powered knowledge base scanner.
  *
- * Uses the extractor module to generate knowledge-rich content instead
- * of just listing file metadata.
+ * Pipeline:
+ *   Phase 1 — Walk & Read:    Scan the file tree, read all files
+ *   Phase 2 — Analyze & Plan: Send file batches to AI, get a plan of KB entries
+ *   Phase 3 — Generate:       Send each planned entry's files to AI, get rich markdown content
+ *   Phase 4 — Collect:        Assemble final entries with frontmatter
+ *
+ * Falls back to static extraction (extractor.ts) if AI is unavailable.
  */
 
-import { readFile, stat, readdir } from "node:fs/promises";
-import { join, relative, extname, basename, dirname } from "node:path";
+import { readFile, stat, readdir, mkdir, writeFile } from "node:fs/promises";
+import { join, extname, basename, dirname } from "node:path";
+import { createHash } from "node:crypto";
 import type {
 	ScannedFile,
 	KbEntry,
 	KbCategory,
-	FileClassification,
 	KbConfig,
 	KbEntryFrontmatter,
 } from "./types.js";
-import {
-	DEFAULT_IGNORE_PATTERNS,
-	EXTENSION_CATEGORY_MAP,
-	FILENAME_CATEGORY_MAP,
-} from "./types.js";
-import { createHash } from "node:crypto";
+import { DEFAULT_IGNORE_PATTERNS } from "./types.js";
 import { isSensitiveFile, sanitizeFileContent } from "./sanitize.js";
+import {
+	askLlm,
+	batchFiles,
+	createTempDir,
+	cleanupTempDir,
+	formatDuration,
+	formatTokens,
+	type AiClientOptions,
+	type FileBatch,
+	type PlannedEntry,
+} from "./ai-client.js";
+import { writeFile as writeFileAsync } from "node:fs/promises";
 import {
 	extractFileKnowledge,
 	mergeKnowledge,
 	generateDescription,
-	type ExtractedKnowledge,
-	type FileKnowledge,
 } from "./extractor.js";
 
 // ---------------------------------------------------------------------------
@@ -37,23 +45,18 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface ScanProgress {
-	/** Current phase of the scan */
-	phase: "walking" | "reading" | "classifying" | "extracting" | "generating" | "writing";
-	/** Human-readable status message */
+	phase: "walking" | "reading" | "analyzing" | "planning" | "generating" | "writing";
 	message: string;
-	/** Files processed so far in the current phase */
 	processed: number;
-	/** Total files to process in the current phase (0 if unknown) */
 	total: number;
 }
 
 export type ProgressCallback = (progress: ScanProgress) => void;
 
 // ---------------------------------------------------------------------------
-// File walking
+// File walking (same as before — static, fast)
 // ---------------------------------------------------------------------------
 
-/** Recursively walk a directory, yielding relative file paths. */
 async function* walkDir(
 	root: string,
 	dir: string,
@@ -64,7 +67,6 @@ async function* walkDir(
 
 	for (const entry of entries) {
 		const relPath = dir ? join(dir, entry.name) : entry.name;
-
 		if (shouldIgnore(entry.name, relPath, ignorePatterns)) continue;
 
 		if (entry.isDirectory()) {
@@ -92,31 +94,22 @@ function shouldIgnore(name: string, relPath: string, patterns: string[]): boolea
 	return false;
 }
 
-// ---------------------------------------------------------------------------
-// File reading
-// ---------------------------------------------------------------------------
-
 async function readScannedFile(root: string, relPath: string): Promise<ScannedFile | null> {
 	if (isSensitiveFile(relPath)) return null;
-
 	const absPath = join(root, relPath);
 	try {
 		const fileStat = await stat(absPath);
 		if (fileStat.size > 500_000) return null;
-
 		let raw = await readFile(absPath, "utf-8");
 		const sanitized = sanitizeFileContent(relPath, raw);
 		if (sanitized === null) return null;
 		raw = sanitized;
-
-		const lines = raw.split("\n").length;
-
 		return {
 			path: absPath,
 			relativePath: relPath,
 			extension: extname(relPath).toLowerCase(),
 			size: fileStat.size,
-			lines,
+			lines: raw.split("\n").length,
 			lastModified: fileStat.mtime,
 			content: raw,
 		};
@@ -125,284 +118,260 @@ async function readScannedFile(root: string, relPath: string): Promise<ScannedFi
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Classification
-// ---------------------------------------------------------------------------
-
-function detectLanguage(ext: string): string {
-	const map: Record<string, string> = {
-		".ts": "TypeScript", ".tsx": "TypeScript (React)", ".js": "JavaScript", ".jsx": "JavaScript (React)",
-		".py": "Python", ".rb": "Ruby", ".go": "Go", ".rs": "Rust", ".java": "Java", ".kt": "Kotlin",
-		".swift": "Swift", ".c": "C", ".cpp": "C++", ".cs": "C#", ".php": "PHP", ".scala": "Scala",
-		".ex": "Elixir", ".exs": "Elixir", ".erl": "Erlang", ".hs": "Haskell", ".lua": "Lua",
-		".r": "R", ".sql": "SQL", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
-		".html": "HTML", ".xml": "XML", ".json": "JSON", ".yaml": "YAML", ".yml": "YAML",
-		".toml": "TOML", ".md": "Markdown", ".css": "CSS", ".scss": "SCSS", ".less": "LESS",
-		".graphql": "GraphQL", ".proto": "Protocol Buffers", ".tf": "Terraform", ".dart": "Dart",
-		".vue": "Vue", ".svelte": "Svelte",
-	};
-	return map[ext] || "Unknown";
-}
-
-/** Classify a file into a category with a grouping key. */
-function classifyFile(file: ScannedFile): FileClassification {
-	const basenameNoExt = basename(file.relativePath, file.extension).toLowerCase();
-	const filename = basename(file.relativePath).toLowerCase();
-	const dirParts = dirname(file.relativePath).split("/");
-
-	for (const [pattern, category] of Object.entries(FILENAME_CATEGORY_MAP)) {
-		if (filename === pattern.toLowerCase() || basenameNoExt === pattern.toLowerCase()) {
-			return { category, priority: 10, groupKey: dirParts.join("/") };
-		}
-		if (basenameNoExt.startsWith(pattern.toLowerCase() + ".")) {
-			return { category, priority: 9, groupKey: dirParts.join("/") };
-		}
-	}
-
-	const extCategory = EXTENSION_CATEGORY_MAP[file.extension];
-	if (extCategory) {
-		return { category: extCategory, priority: 5, groupKey: dirParts.join("/") };
-	}
-
-	if (basenameNoExt.includes(".test") || basenameNoExt.includes(".spec") || basenameNoExt.includes("_test")) {
-		return { category: "testing", priority: 8, groupKey: dirParts.join("/") };
-	}
-
-	if (file.extension === ".sh" || file.extension === ".bash" || file.extension === ".py") {
-		const isScript = dirParts.some((d) => d === "scripts" || d === "bin" || d === "tools");
-		if (isScript) return { category: "scripts", priority: 7, groupKey: dirParts.join("/") };
-	}
-
-	const lang = detectLanguage(file.extension);
-	if (
-		lang.includes("TypeScript") || lang.includes("JavaScript") || lang === "Python" ||
-		lang === "Go" || lang === "Rust" || lang === "Ruby" || lang === "Java" ||
-		lang === "Kotlin" || lang === "Swift" || lang === "PHP" || lang === "C#" ||
-		lang.includes("C++") || lang === "C" || lang === "Dart" || lang === "Scala"
-	) {
-		return { category: "module", priority: 3, groupKey: dirParts.join("/") };
-	}
-
-	if (file.extension === ".md") {
-		return { category: "documentation", priority: 4, groupKey: dirParts.join("/") };
-	}
-
-	if (dirParts.some((d) => d === "routes" || d === "api" || d === "controllers" || d === "handlers" || d === "resolvers")) {
-		return { category: "api", priority: 6, groupKey: "api" };
-	}
-
-	if (dirParts.some((d) => d === "models" || d === "entities" || d === "schemas" || d === "migrations" || d === "prisma")) {
-		return { category: "data-model", priority: 6, groupKey: "data-model" };
-	}
-
-	return { category: "general", priority: 1, groupKey: dirParts.join("/") };
-}
-
-// ---------------------------------------------------------------------------
-// Knowledge-based content generation
-// ---------------------------------------------------------------------------
-
-/** Generate a clean, readable filename from a group key. */
-function pathToFilename(groupKey: string): string {
-	const cleaned = groupKey
-		.replace(/[:/\\]/g, "_")
-		.replace(/_\./g, "_")
-		.replace(/\.+/g, ".")
-		.replace(/_+/g, "_")
-		.replace(/(^_|_$|\.$)/g, "")
-		.replace(/_\./g, "_");
-	return (cleaned || "general") + ".md";
-}
-
-/** Compute a SHA-256 hash of file content for change detection. */
 export function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
-/** Generate an entry description from the first file's doc comment or purpose. */
-function buildEntryDescription(
-	category: KbCategory,
-	firstFile: ScannedFile,
-	fileKnowledges: FileKnowledge[],
-): string {
-	// Use the extractor's description generator
-	const merged = mergeKnowledge(fileKnowledges);
-	return generateDescription(merged, category);
+// ---------------------------------------------------------------------------
+// AI Prompts
+// ---------------------------------------------------------------------------
+
+const PLAN_SYSTEM_PROMPT = `You are a codebase knowledge base architect. Your job is to analyze source code and plan how to organize it into a knowledge base.
+
+You will receive a batch of source files. Analyze them and produce a JSON plan of knowledge base entries.
+
+RULES:
+1. Group related files together into logical entries
+2. Each entry should cover a cohesive topic (a module, a feature, a config area, etc.)
+3. Categories: architecture, module, api, config, data-model, testing, build, documentation, scripts, styles, infrastructure, general
+4. Use descriptive titles that tell you WHAT the code does, not just where it lives
+5. The brief should explain the entry's PURPOSE — what would someone need to know when referencing this entry?
+
+OUTPUT FORMAT — respond with ONLY a JSON array, no markdown fences, no explanation:
+[
+  {
+    "filename": "module_auth.md",
+    "title": "Authentication Module",
+    "category": "module",
+    "sourceFiles": ["src/auth/index.ts", "src/auth/tokens.ts"],
+    "brief": "Handles user authentication via JWT tokens, session management, and password hashing"
+  }
+]
+
+If a file doesn't fit well with others, give it its own entry. Aim for entries that are useful to someone asking "how does X work?"`;
+
+const GENERATE_SYSTEM_PROMPT = `You are a knowledge base writer for a codebase documentation system. Your job is to read source code and write a comprehensive, useful knowledge base entry.
+
+You will receive source files for a specific part of the codebase. Write a markdown document that captures REAL KNOWLEDGE about this code.
+
+STRUCTURE your entry with these sections (include only sections that have meaningful content):
+
+## Purpose
+What does this code DO and WHY? One clear paragraph.
+
+## How It Works
+Step-by-step explanation of the logic, data flow, and key mechanisms. This is the most important section.
+
+## Key Concepts
+Important abstractions, types, or ideas the code introduces. Use bullet points.
+
+## API Surface
+What functions/types/classes does this module expose? Include brief signatures.
+
+## Configuration
+Any settings, options, or constants that control behavior.
+
+## Dependencies
+What external packages does this rely on and what are they used for?
+
+## Error Handling
+How does this code handle failures? What error types exist?
+
+## Constraints & Invariants
+Important assumptions, limitations, or validation rules.
+
+## When to Reference
+Bullet list of scenarios where someone would need to look at this code.
+
+RULES:
+- Write PROSE, not just lists. Explain the "why" behind design decisions.
+- Be specific — mention actual function names, type names, variable names
+- Focus on knowledge that helps someone understand, modify, or debug the code
+- Do NOT just paraphrase the code — explain the INTENT and BEHAVIOR
+- Keep it concise but comprehensive — aim for quality over length
+- Do NOT include the source code itself — extract knowledge FROM it`;
+
+// ---------------------------------------------------------------------------
+// AI Pipeline Phases
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2: Send file batches to AI to plan the KB structure.
+ * Returns a merged list of planned entries across all batches.
+ */
+async function planEntriesFromBatches(
+	batches: FileBatch[],
+	options: AiClientOptions,
+	onProgress?: ProgressCallback,
+): Promise<PlannedEntry[]> {
+	const allPlans: PlannedEntry[] = [];
+	const tmpDir = await createTempDir("pi-kb-plan-");
+
+	try {
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i];
+			onProgress?.({
+				phase: "planning",
+				message: `Analyzing batch ${i + 1}/${batches.length} (${batch.files.length} files, ~${formatTokens(batch.estimatedTokens)} tokens)`,
+				processed: i,
+				total: batches.length,
+			});
+
+			// Save batch content to temp file (prompts can be large)
+			const batchFile = join(tmpDir, `batch-${i}.md`);
+			await writeFileAsync(batchFile, batch.content, "utf-8");
+
+			const userPrompt = `Analyze these ${batch.files.length} source files from the project and plan knowledge base entries for them.\n\nThe files are in a project at the working directory. Here are the file contents:\n\nFile path: ${batchFile}`;
+
+			const result = await askLlm(PLAN_SYSTEM_PROMPT, userPrompt, options);
+
+			// Parse the JSON response
+			const plans = parsePlansFromResponse(result.text);
+			allPlans.push(...plans);
+		}
+	} finally {
+		await cleanupTempDir(tmpDir);
+	}
+
+	return allPlans;
 }
 
-/** Generate the markdown body for a knowledge base entry. */
-function generateEntryContent(
-	category: KbCategory,
-	groupKey: string,
-	fileKnowledges: FileKnowledge[],
-	dirPart: string,
-): string {
-	const merged = mergeKnowledge(fileKnowledges);
-	const sections: string[] = [];
+/**
+ * Phase 3: Generate rich content for each planned entry via AI.
+ * Processes entries in parallel (up to a concurrency limit).
+ */
+async function generateEntriesContent(
+	plannedEntries: PlannedEntry[],
+	fileContentMap: Map<string, string>,
+	options: AiClientOptions,
+	onProgress?: ProgressCallback,
+	concurrency: number = 3,
+): Promise<Map<string, string>> {
+	const results = new Map<string, string>();
+	let completed = 0;
 
-	// --- Purpose ---
-	if (merged.purpose) {
-		sections.push(`## Purpose\n`);
-		sections.push(merged.purpose);
-		sections.push("");
+	// Process in chunks of `concurrency`
+	for (let i = 0; i < plannedEntries.length; i += concurrency) {
+		const chunk = plannedEntries.slice(i, i + concurrency);
+
+		await Promise.all(
+			chunk.map(async (entry) => {
+				onProgress?.({
+					phase: "generating",
+					message: `Generating: ${entry.title}`,
+					processed: completed,
+					total: plannedEntries.length,
+				});
+
+				// Collect the source file contents for this entry
+				const fileContents: string[] = [];
+				for (const sf of entry.sourceFiles) {
+					const content = fileContentMap.get(sf);
+					if (content) {
+						fileContents.push(`=== ${sf} ===\n${content}`);
+					}
+				}
+
+				if (fileContents.length === 0) return;
+
+				const userPrompt =
+					`Write a knowledge base entry for: **${entry.title}**\n\n` +
+					`Category: ${entry.category}\n` +
+					`Purpose: ${entry.brief}\n\n` +
+					`Source files:\n${fileContents.join("\n\n")}`;
+
+				try {
+					const result = await askLlm(GENERATE_SYSTEM_PROMPT, userPrompt, options);
+					results.set(entry.filename, result.text);
+				} catch (err) {
+					// Fallback: use static extraction
+					const fallback = generateStaticFallback(entry, fileContentMap);
+					results.set(entry.filename, fallback);
+				}
+
+				completed++;
+			}),
+		);
 	}
 
-	// --- File Summary (compact) ---
-	if (fileKnowledges.length === 1) {
-		sections.push(`## Source\n`);
-		sections.push(`\`${fileKnowledges[0].file.relativePath}\` (${fileKnowledges[0].file.lines} lines, ${detectLanguage(fileKnowledges[0].file.extension)})`);
-		sections.push("");
-	} else {
-		sections.push(`## Files (${fileKnowledges.length})\n`);
-		for (const fk of fileKnowledges) {
-			const purpose = fk.purpose || detectLanguage(fk.file.extension) + " file";
-			sections.push(`- \`${fk.file.relativePath}\` (${fk.file.lines} lines) — ${purpose.length > 100 ? purpose.slice(0, 97) + "..." : purpose}`);
-		}
-		sections.push("");
-	}
-
-	// --- Responsibilities ---
-	if (merged.responsibilities.length > 0) {
-		sections.push("## Responsibilities\n");
-		for (const r of merged.responsibilities.slice(0, 8)) {
-			sections.push(`- ${r}`);
-		}
-		sections.push("");
-	}
-
-	// --- Key Concepts ---
-	if (merged.keyConcepts.length > 0) {
-		sections.push("## Key Concepts\n");
-		for (const kc of merged.keyConcepts.slice(0, 10)) {
-			sections.push(`- ${kc}`);
-		}
-		sections.push("");
-	}
-
-	// --- API Surface ---
-	if (merged.apiSurface.length > 0) {
-		sections.push("## API Surface\n");
-		for (const api of merged.apiSurface.slice(0, 10)) {
-			sections.push(`- ${api}`);
-		}
-		sections.push("");
-	}
-
-	// --- Data Flow ---
-	if (merged.dataFlow.length > 0) {
-		sections.push("## Data Flow\n");
-		for (const df of merged.dataFlow.slice(0, 6)) {
-			sections.push(`- ${df}`);
-		}
-		sections.push("");
-	}
-
-	// --- Patterns ---
-	if (merged.patterns.length > 0) {
-		sections.push("## Patterns\n");
-		for (const p of merged.patterns) {
-			sections.push(`- ${p}`);
-		}
-		sections.push("");
-	}
-
-	// --- Configuration ---
-	if (merged.configuration.length > 0) {
-		sections.push("## Configuration\n");
-		for (const c of merged.configuration.slice(0, 8)) {
-			sections.push(`- ${c}`);
-		}
-		sections.push("");
-	}
-
-	// --- Dependencies ---
-	if (merged.dependencyPurposes.length > 0) {
-		sections.push("## Dependencies\n");
-		for (const dep of merged.dependencyPurposes.slice(0, 10)) {
-			sections.push(`- ${dep}`);
-		}
-		sections.push("");
-	}
-
-	// --- Error Handling ---
-	if (merged.errorHandling.length > 0) {
-		sections.push("## Error Handling\n");
-		for (const eh of merged.errorHandling) {
-			sections.push(`- ${eh}`);
-		}
-		sections.push("");
-	}
-
-	// --- Constraints ---
-	if (merged.constraints.length > 0) {
-		sections.push("## Constraints\n");
-		for (const c of merged.constraints) {
-			sections.push(`- ${c}`);
-		}
-		sections.push("");
-	}
-
-	// --- Agent guidance ---
-	sections.push("## When to Reference\n");
-	sections.push(generateAgentUsage(category, dirPart, merged));
-	sections.push("");
-
-	return sections.join("\n");
+	return results;
 }
 
-/** Generate agent usage instructions for a KB entry based on extracted knowledge. */
-function generateAgentUsage(
-	category: KbCategory,
-	dirPart: string,
-	knowledge: ExtractedKnowledge,
-): string {
-	const instructions: string[] = [];
-	instructions.push("> 🤖 **Agent guidance**: Consult this entry when you need to:");
+// ---------------------------------------------------------------------------
+// JSON parsing helpers
+// ---------------------------------------------------------------------------
 
-	switch (category) {
-		case "module":
-			instructions.push(`- Understand what the \`${dirPart || "root"}\` module does and why`);
-			instructions.push("- Find where a function or type is defined and how it works");
-			instructions.push("- Understand the module's responsibilities and API surface");
-			if (knowledge.dataFlow.length > 0) instructions.push("- Trace data flow through this module");
-			if (knowledge.patterns.length > 0) instructions.push("- Understand design patterns used here");
-			break;
-		case "api":
-			instructions.push("- Find API endpoints, routes, or handlers");
-			instructions.push("- Understand request/response patterns and data flow");
-			instructions.push("- Locate middleware or authentication logic");
-			break;
-		case "config":
-			instructions.push("- Check project configuration options and their effects");
-			instructions.push("- Understand build or tool settings and dependencies");
-			break;
-		case "testing":
-			instructions.push("- Understand test coverage and what behaviors are tested");
-			instructions.push("- Find test utilities or fixtures");
-			instructions.push("- Write new tests following existing patterns");
-			break;
-		case "build":
-			instructions.push("- Understand build scripts, dependencies, and how to build");
-			instructions.push("- Modify package configuration or scripts");
-			break;
-		case "documentation":
-			instructions.push("- Find user-facing docs or README content");
-			instructions.push("- Understand project features or usage");
-			break;
-		case "data-model":
-			instructions.push("- Understand database schemas or data structures");
-			instructions.push("- Find model definitions, types, or migrations");
-			break;
-		case "architecture":
-			instructions.push("- Understand high-level design decisions and system structure");
-			break;
-		default:
-			instructions.push(`- Look up details about the ${dirPart || "project"} area`);
-			instructions.push("- Find file locations or configuration");
-			break;
+/** Parse planned entries from the LLM's JSON response. */
+function parsePlansFromResponse(text: string): PlannedEntry[] {
+	// Strip markdown fences if present
+	let cleaned = text.trim();
+	if (cleaned.startsWith("```")) {
+		cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
 	}
 
-	return instructions.join("\n");
+	try {
+		const parsed = JSON.parse(cleaned);
+		if (!Array.isArray(parsed)) return [];
+
+		return parsed
+			.filter((p: any) => p.filename && p.sourceFiles && Array.isArray(p.sourceFiles))
+			.map((p: any) => ({
+				filename: String(p.filename),
+				title: String(p.title || p.filename),
+				category: String(p.category || "general"),
+				sourceFiles: (p.sourceFiles as string[]).map(String),
+				brief: String(p.brief || p.description || ""),
+			}));
+	} catch {
+		// Try to extract JSON array from the text
+		const match = cleaned.match(/\[[\s\S]*\]/);
+		if (match) {
+			try {
+				const parsed = JSON.parse(match[0]);
+				return parsed
+					.filter((p: any) => p.filename && p.sourceFiles)
+					.map((p: any) => ({
+						filename: String(p.filename),
+						title: String(p.title || p.filename),
+						category: String(p.category || "general"),
+						sourceFiles: (p.sourceFiles as string[]).map(String),
+						brief: String(p.brief || p.description || ""),
+					}));
+			} catch {
+				return [];
+			}
+		}
+		return [];
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Static fallback (uses extractor.ts)
+// ---------------------------------------------------------------------------
+
+function generateStaticFallback(
+	entry: PlannedEntry,
+	fileContentMap: Map<string, string>,
+): string {
+	const parts: string[] = [];
+
+	parts.push(`## Purpose\n`);
+	parts.push(entry.brief || `${entry.category} module.`);
+	parts.push("");
+
+	parts.push(`## Files (${entry.sourceFiles.length})\n`);
+	for (const sf of entry.sourceFiles) {
+		const content = fileContentMap.get(sf);
+		const lines = content ? content.split("\n").length : "?";
+		parts.push(`- \`${sf}\` (${lines} lines)`);
+	}
+	parts.push("");
+
+	parts.push("## When to Reference\n");
+	parts.push(`> Consult this entry when you need to understand ${entry.title.toLowerCase()}.`);
+	parts.push("");
+
+	return parts.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +384,7 @@ export interface ScanResult {
 	totalFilesScanned: number;
 }
 
-/** Scan the codebase and generate knowledge base entries. */
+/** Scan the codebase using AI to generate rich knowledge base entries. */
 export async function scanCodebase(
 	cwd: string,
 	config: KbConfig,
@@ -423,234 +392,142 @@ export async function scanCodebase(
 ): Promise<ScanResult> {
 	const allIgnore = [...DEFAULT_IGNORE_PATTERNS, ...config.ignorePatterns];
 	const fileHashes: Record<string, string> = {};
-	const fileMap = new Map<string, ScannedFile>();
+	const fileContentMap = new Map<string, string>();
+	const filePaths: string[] = [];
 
-	// --- Phase 1: Walk files ---
+	// --- Phase 1: Walk & Read (static, fast) ---
 	onProgress?.({ phase: "walking", message: "Scanning directory structure...", processed: 0, total: 0 });
 
-	const filePaths: string[] = [];
 	for await (const relPath of walkDir(cwd, "", allIgnore, config.includeExtensions)) {
 		filePaths.push(relPath);
 	}
 
-	// --- Phase 2: Read files ---
-	onProgress?.({
-		phase: "reading",
-		message: `Reading ${filePaths.length} files...`,
-		processed: 0,
-		total: filePaths.length,
-	});
+	onProgress?.({ phase: "reading", message: `Reading ${filePaths.length} files...`, processed: 0, total: filePaths.length });
 
-	let readCount = 0;
-	for (const relPath of filePaths) {
-		readCount++;
-		if (readCount % 25 === 0 || readCount === filePaths.length) {
-			onProgress?.({
-				phase: "reading",
-				message: `Reading files... (${readCount}/${filePaths.length})`,
-				processed: readCount,
-				total: filePaths.length,
-			});
+	for (let i = 0; i < filePaths.length; i++) {
+		const relPath = filePaths[i];
+		if ((i + 1) % 25 === 0 || i === filePaths.length - 1) {
+			onProgress?.({ phase: "reading", message: `Reading files... (${i + 1}/${filePaths.length})`, processed: i + 1, total: filePaths.length });
 		}
 
 		const scanned = await readScannedFile(cwd, relPath);
 		if (scanned) {
-			fileMap.set(relPath, scanned);
+			fileContentMap.set(relPath, scanned.content);
 			fileHashes[relPath] = hashContent(scanned.content);
 		}
 	}
 
-	// --- Phase 3: Classify ---
-	onProgress?.({
-		phase: "classifying",
-		message: `Classifying ${fileMap.size} files...`,
-		processed: 0,
-		total: fileMap.size,
-	});
-
-	const groups = new Map<string, { files: ScannedFile[]; category: KbCategory }>();
-
-	for (const file of fileMap.values()) {
-		const classification = classifyFile(file);
-
-		let groupKey: string;
-		if (classification.category === "module" || classification.category === "general") {
-			const dir = dirname(file.relativePath);
-			groupKey = `${classification.category}:${dir || "."}`;
-		} else if (classification.category === "documentation" && file.extension === ".md") {
-			groupKey = `doc:${file.relativePath}`;
-		} else {
-			groupKey = `${classification.category}:${classification.groupKey}`;
-		}
-
-		if (!groups.has(groupKey)) {
-			groups.set(groupKey, { files: [], category: classification.category });
-		}
-		groups.get(groupKey)!.files.push(file);
+	if (fileContentMap.size === 0) {
+		return { entries: [], fileHashes, totalFilesScanned: 0 };
 	}
 
-	// --- Phase 4: Extract knowledge ---
-	onProgress?.({
-		phase: "extracting",
-		message: `Extracting knowledge from ${groups.size} groups...`,
-		processed: 0,
-		total: groups.size,
-	});
+	// --- Phase 2: Batch files and send to AI for planning ---
+	onProgress?.({ phase: "analyzing", message: "Batching files for AI analysis...", processed: 0, total: 0 });
 
-	// Extract knowledge per file, then group
-	const fileKnowledgeMap = new Map<string, FileKnowledge>();
-	let extractCount = 0;
-	for (const file of fileMap.values()) {
-		extractCount++;
-		if (extractCount % 15 === 0 || extractCount === fileMap.size) {
-			onProgress?.({
-				phase: "extracting",
-				message: `Extracting knowledge... (${extractCount}/${fileMap.size} files)`,
-				processed: extractCount,
-				total: fileMap.size,
-			});
-		}
-		fileKnowledgeMap.set(file.relativePath, extractFileKnowledge(file));
+	const batches = await batchFiles(cwd, [...fileContentMap.keys()], 60000,
+		(file, idx, total) => {
+			if ((idx + 1) % 50 === 0 || idx === total - 1) {
+				onProgress?.({ phase: "analyzing", message: `Preparing batches... (${idx + 1}/${total} files)`, processed: idx + 1, total });
+			}
+		},
+	);
+
+	const aiOptions: AiClientOptions = { cwd, signal: undefined };
+
+	// Plan: ask AI what entries to create
+	let plannedEntries: PlannedEntry[];
+	try {
+		onProgress?.({ phase: "planning", message: `Planning KB structure from ${batches.length} batch(es)...`, processed: 0, total: batches.length });
+		plannedEntries = await planEntriesFromBatches(batches, aiOptions, onProgress);
+	} catch {
+		// AI unavailable — fall back to static extraction
+		onProgress?.({ phase: "planning", message: "AI unavailable, using static analysis...", processed: 0, total: 0 });
+		plannedEntries = planStaticEntries(fileContentMap);
 	}
 
-	// --- Phase 5: Generate entries ---
+	if (plannedEntries.length === 0) {
+		plannedEntries = planStaticEntries(fileContentMap);
+	}
+
+	// --- Phase 3: Generate content for each entry via AI ---
 	onProgress?.({
 		phase: "generating",
-		message: `Generating ${groups.size} knowledge entries...`,
+		message: `Generating ${plannedEntries.length} entries...`,
 		processed: 0,
-		total: groups.size,
+		total: plannedEntries.length,
 	});
 
+	let contentMap: Map<string, string>;
+	try {
+		contentMap = await generateEntriesContent(plannedEntries, fileContentMap, aiOptions, onProgress);
+	} catch {
+		// Full fallback to static
+		contentMap = new Map();
+		for (const entry of plannedEntries) {
+			contentMap.set(entry.filename, generateStaticFallback(entry, fileContentMap));
+		}
+	}
+
+	// --- Phase 4: Assemble entries ---
+	onProgress?.({ phase: "writing", message: "Assembling entries...", processed: 0, total: plannedEntries.length });
+
 	const entries: KbEntry[] = [];
-	const groupEntries = [...groups.entries()];
+	for (const plan of plannedEntries) {
+		const content = contentMap.get(plan.filename) || generateStaticFallback(plan, fileContentMap);
+		const now = new Date().toISOString();
 
-	for (let gi = 0; gi < groupEntries.length; gi++) {
-		const [groupKey, group] = groupEntries[gi];
-
-		if (gi % 5 === 0 || gi === groupEntries.length - 1) {
-			onProgress?.({
-				phase: "generating",
-				message: `Generating entries... (${gi + 1}/${groupEntries.length})`,
-				processed: gi + 1,
-				total: groupEntries.length,
-			});
+		// Extract tags from source file extensions
+		const tags = new Set<string>();
+		tags.add(plan.category);
+		for (const sf of plan.sourceFiles) {
+			const ext = extname(sf).replace(".", "");
+			if (ext) tags.add(ext);
 		}
 
-		const sortedFiles = [...group.files].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+		const frontmatter: KbEntryFrontmatter = {
+			title: plan.title,
+			description: plan.brief || `${plan.category} — ${plan.sourceFiles.length} files`,
+			category: (plan.category as KbCategory) || "general",
+			tags: [...tags],
+			related: [],
+			updatedAt: now,
+			sourceFiles: plan.sourceFiles,
+		};
 
-		// For large groups, split into sub-entries
-		if (sortedFiles.length > 10) {
-			const chunks: ScannedFile[][] = [];
-			for (let i = 0; i < sortedFiles.length; i += 8) {
-				chunks.push(sortedFiles.slice(i, i + 8));
-			}
-
-			for (let ci = 0; ci < chunks.length; ci++) {
-				const chunk = chunks[ci];
-				const entry = generateEntry(
-					group.category, groupKey, chunk, config,
-					fileKnowledgeMap, ci > 0 ? `-part${ci + 1}` : "",
-				);
-				entries.push(entry);
-			}
-		} else {
-			const entry = generateEntry(group.category, groupKey, sortedFiles, config, fileKnowledgeMap);
-			entries.push(entry);
-		}
+		entries.push({
+			filename: plan.filename,
+			frontmatter,
+			content,
+		});
 	}
 
-	return { entries, fileHashes, totalFilesScanned: fileMap.size };
+	return { entries, fileHashes, totalFilesScanned: fileContentMap.size };
 }
 
-function generateEntry(
-	category: KbCategory,
-	groupKey: string,
-	files: ScannedFile[],
-	config: KbConfig,
-	fileKnowledgeMap: Map<string, FileKnowledge>,
-	suffix = "",
-): KbEntry {
-	const firstFile = files[0];
-	const dirPart = dirname(firstFile.relativePath);
+/** Static fallback planning: group files by directory. */
+function planStaticEntries(fileContentMap: Map<string, string>): PlannedEntry[] {
+	const groups = new Map<string, string[]>();
 
-	// Determine title
-	let title: string;
-	if (category === "documentation") {
-		title = basename(firstFile.relativePath, firstFile.extension);
-	} else if (dirPart && dirPart !== ".") {
-		title = dirPart + suffix;
-	} else {
-		title = category + suffix;
+	for (const filePath of fileContentMap.keys()) {
+		const dir = dirname(filePath);
+		const key = dir || ".";
+		if (!groups.has(key)) groups.set(key, []);
+		groups.get(key)!.push(filePath);
 	}
 
-	// Collect file knowledges
-	const fileKnowledges = files.map(f => fileKnowledgeMap.get(f.relativePath)!).filter(Boolean);
-
-	// Build tags from file types
-	const tags = new Set<string>();
-	tags.add(category);
-	for (const f of files) {
-		const lang = detectLanguage(f.extension);
-		if (lang !== "Unknown") tags.add(lang.toLowerCase().replace(/[^a-z0-9]/g, "-"));
-		tags.add(f.extension.replace(".", "") || "plain");
+	const entries: PlannedEntry[] = [];
+	for (const [dir, files] of groups) {
+		const filename = dir.replace(/[:/\\]/g, "_").replace(/_+/g, "_") + ".md";
+		entries.push({
+			filename: filename === "_.md" ? "general.md" : filename,
+			title: dir === "." ? "root" : dir,
+			category: "module",
+			sourceFiles: files,
+			brief: `Files in ${dir}`,
+		});
 	}
 
-	// Build related from imports
-	const related: string[] = [];
-	for (const fk of fileKnowledges) {
-		// Reuse import extraction for related entries
-		const lang = detectLanguage(fk.file.extension);
-		if (lang.includes("TypeScript") || lang.includes("JavaScript")) {
-			const importPattern = /(?:import|require)\s*\(?['"](\.\/[^'"]+)['"]/g;
-			let match: RegExpExecArray | null;
-			while ((match = importPattern.exec(fk.file.content)) !== null) {
-				related.push(match[1]);
-			}
-		}
-	}
-
-	// Generate description using knowledge extractor
-	const description = fileKnowledges.length > 0
-		? buildEntryDescription(category, firstFile, fileKnowledges)
-		: `${category} — ${files.length} files in ${dirPart || "root"}`;
-
-	// Generate content using knowledge extractor
-	const content = fileKnowledges.length > 0
-		? generateEntryContent(category, groupKey, fileKnowledges, dirPart)
-		: generateFallbackContent(category, files, dirPart);
-
-	const filename = pathToFilename(groupKey);
-
-	const frontmatter: KbEntryFrontmatter = {
-		title,
-		description,
-		category,
-		tags: [...tags],
-		related: [...new Set(related)].slice(0, 20),
-		updatedAt: new Date().toISOString(),
-		sourceFiles: files.map((f) => f.relativePath),
-	};
-
-	return { filename, frontmatter, content };
-}
-
-/** Minimal fallback when knowledge extraction fails or returns nothing useful. */
-function generateFallbackContent(
-	category: KbCategory,
-	files: ScannedFile[],
-	dirPart: string,
-): string {
-	const parts: string[] = [];
-	parts.push(`## Files (${files.length})\n`);
-	for (const f of files) {
-		const lang = detectLanguage(f.extension);
-		parts.push(`- \`${f.relativePath}\` (${f.lines} lines, ${lang})`);
-	}
-	parts.push("");
-	parts.push("## When to Reference\n");
-	parts.push(`> 🤖 **Agent guidance**: Consult this entry when you need to find files in \`${dirPart || "root"}\`.`);
-	parts.push("");
-	return parts.join("\n");
+	return entries;
 }
 
 /** Quick-scan only files that changed since the last hash map. */
@@ -667,7 +544,6 @@ export async function scanChangedFiles(
 	}
 
 	const previousFiles = new Set(Object.keys(previousHashes));
-
 	const added: string[] = [];
 	const removed: string[] = [];
 	const changed: string[] = [];
@@ -679,17 +555,13 @@ export async function scanChangedFiles(
 			const scanned = await readScannedFile(cwd, f);
 			if (scanned) {
 				const newHash = hashContent(scanned.content);
-				if (newHash !== previousHashes[f]) {
-					changed.push(f);
-				}
+				if (newHash !== previousHashes[f]) changed.push(f);
 			}
 		}
 	}
 
 	for (const f of previousFiles) {
-		if (!currentFiles.has(f)) {
-			removed.push(f);
-		}
+		if (!currentFiles.has(f)) removed.push(f);
 	}
 
 	return { changed, removed, added };

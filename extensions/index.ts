@@ -16,6 +16,7 @@ import { join, basename } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { loadConfig } from "./src/config.js";
 import { scanCodebase, scanChangedFiles, type ScanProgress } from "./src/scanner.js";
+import { formatDuration, formatTokens } from "./src/ai-client.js";
 import {
 	KB_DIR,
 	kbExists,
@@ -81,9 +82,9 @@ function createProgressNotifier(ctx: any): (progress: ScanProgress) => void {
 	const phaseLabels: Record<ScanProgress["phase"], string> = {
 		walking: "Scanning directories",
 		reading: "Reading files",
-		classifying: "Classifying files",
-		extracting: "Extracting knowledge",
-		generating: "Generating entries",
+		analyzing: "Preparing AI batches",
+		planning: "Planning KB structure (AI)",
+		generating: "Generating entries (AI)",
 		writing: "Writing knowledge base",
 	};
 
@@ -126,6 +127,7 @@ async function handleInit(pi: ExtensionAPI, cwd: string, ctx: any): Promise<void
 
 	const config = await loadConfig(cwd);
 	const onProgress = createProgressNotifier(ctx);
+	const startTime = Date.now();
 
 	const { entries, fileHashes, totalFilesScanned } = await scanCodebase(cwd, config, onProgress);
 	const lastCommit = await getHeadCommit(cwd, pi.exec);
@@ -140,12 +142,14 @@ async function handleInit(pi: ExtensionAPI, cwd: string, ctx: any): Promise<void
 		.map(([cat, n]) => `${cat}: ${n}`)
 		.join(", ");
 
+	const elapsed = formatDuration(Date.now() - startTime);
+
 	ctx.ui.notify(
 		`✅ Knowledge base created!\n` +
 			`  📁 Files scanned: ${result.filesScanned}\n` +
 			`  📝 Entries created: ${result.entriesCreated}\n` +
 			`  🏷️ Categories: ${catList}\n` +
-			`  ⏱️ Duration: ${result.durationMs}ms\n` +
+			`  ⏱️ Duration: ${elapsed}\n` +
 			`  📍 Location: .kb/`,
 		"info",
 	);
