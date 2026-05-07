@@ -24,19 +24,19 @@ const SECRET_PATTERNS: SecretPattern[] = [
 	{
 		name: "password-assignment",
 		pattern: /\b(password|passwd|pwd|pass)\s*[:=]\s*['"]?([^\s'"`,;}\]){&]+)['"]?/gi,
-		replacement: "$1=$2[REDACTED]",
+		replacement: "$1=[REDACTED]",
 	},
 	{
 		name: "secret-assignment",
 		pattern:
 			/\b(secret|secret_key|secretkey|secret_token|secrettoken)\s*[:=]\s*['"]?([^\s'"`,;}\]){&]+)['"]?/gi,
-		replacement: "$1=$2[REDACTED]",
+		replacement: "$1=[REDACTED]",
 	},
 	{
 		name: "token-assignment",
 		pattern:
 			/\b(api_key|apikey|api_secret|apisecret|access_token|accesstoken|auth_token|authtoken|private_key|privatekey)\s*[:=]\s*['"]?([^\s'"`,;}\]){&]+)['"]?/gi,
-		replacement: "$1=$2[REDACTED]",
+		replacement: "$1=[REDACTED]",
 	},
 	{
 		name: "credentials-url",
@@ -164,7 +164,7 @@ const SENSITIVE_FILENAMES = new Set([
 	".env.staging",
 	".env.test",
 	".env.ci",
-	".env.example", // keep — has no real secrets
+	// .env.example is safe — contains no real secrets
 	".npmrc",
 	".pypirc",
 	".netrc",
@@ -186,7 +186,7 @@ const SENSITIVE_FILENAMES = new Set([
 
 /** Patterns for filenames that likely contain secrets. */
 const SENSITIVE_PATTERNS = [
-	/\.env\./i,
+	/\.env\.(?!example)/i,
 	/^credentials/i,
 	/^secrets?[\._-]/i,
 	/^.*\.pem$/i,
@@ -195,7 +195,7 @@ const SENSITIVE_PATTERNS = [
 	/^.*\.jks$/i,
 	/^.*\.keystore$/i,
 	/^id_(rsa|ed25519|ecdsa|dsa)$/i,
-	/\.key$/i,
+	/\.key$/i,  // matches files ending in .key, NOT config.json
 ];
 
 // ---------------------------------------------------------------------------

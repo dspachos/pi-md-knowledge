@@ -182,8 +182,15 @@ export function parseEntry(raw: string, filename: string): KbEntry | null {
 
 // Minimal YAML helpers (no dependency)
 function extractYamlString(yaml: string, key: string): string | null {
-	const match = yaml.match(new RegExp(`^${key}:\\s*"?([^"]*)"?\\s*$`, "m"));
-	return match ? match[1].trim() : null;
+	// Try quoted value first: key: "value"
+	const quotedMatch = yaml.match(new RegExp(`^${key}:\\s*"([^"]*)"\\s*$`, "m"));
+	if (quotedMatch) return quotedMatch[1].trim();
+
+	// Unquoted value: key: value  (stop before next key or end)
+	const unquotedMatch = yaml.match(new RegExp(`^${key}:\\s*([^:\\n]+?)\\s*$`, "m"));
+	if (unquotedMatch) return unquotedMatch[1].trim();
+
+	return null;
 }
 
 function extractYamlList(yaml: string, key: string): string[] {
