@@ -1,6 +1,10 @@
 /**
  * Codebase scanner — walks the file tree, reads files, classifies them,
- * and groups them into logical knowledge-base entries.
+ * groups them into logical knowledge-base entries, and extracts
+ * MEANINGFUL knowledge from the source code.
+ *
+ * Uses the extractor module to generate knowledge-rich content instead
+ * of just listing file metadata.
  */
 
 import { readFile, stat, readdir } from "node:fs/promises";
@@ -20,6 +24,30 @@ import {
 } from "./types.js";
 import { createHash } from "node:crypto";
 import { isSensitiveFile, sanitizeFileContent } from "./sanitize.js";
+import {
+	extractFileKnowledge,
+	mergeKnowledge,
+	generateDescription,
+	type ExtractedKnowledge,
+	type FileKnowledge,
+} from "./extractor.js";
+
+// ---------------------------------------------------------------------------
+// Progress reporting
+// ---------------------------------------------------------------------------
+
+export interface ScanProgress {
+	/** Current phase of the scan */
+	phase: "walking" | "reading" | "classifying" | "extracting" | "generating" | "writing";
+	/** Human-readable status message */
+	message: string;
+	/** Files processed so far in the current phase */
+	processed: number;
+	/** Total files to process in the current phase (0 if unknown) */
+	total: number;
+}
+
+export type ProgressCallback = (progress: ScanProgress) => void;
 
 // ---------------------------------------------------------------------------
 // File walking
@@ -37,7 +65,6 @@ async function* walkDir(
 	for (const entry of entries) {
 		const relPath = dir ? join(dir, entry.name) : entry.name;
 
-		// Check ignore patterns
 		if (shouldIgnore(entry.name, relPath, ignorePatterns)) continue;
 
 		if (entry.isDirectory()) {
@@ -55,13 +82,10 @@ async function* walkDir(
 function shouldIgnore(name: string, relPath: string, patterns: string[]): boolean {
 	for (const pattern of patterns) {
 		if (pattern.startsWith("*.")) {
-			// Extension glob: *.lock, *.min.js
 			if (name.endsWith(pattern.slice(1))) return true;
 		} else if (pattern.startsWith(".")) {
-			// Hidden directory or file
 			if (name === pattern || relPath.split("/").some((s) => s === pattern)) return true;
 		} else {
-			// Plain name match (directory or file)
 			if (name === pattern || relPath.split("/").some((s) => s === pattern)) return true;
 		}
 	}
@@ -73,19 +97,16 @@ function shouldIgnore(name: string, relPath: string, patterns: string[]): boolea
 // ---------------------------------------------------------------------------
 
 async function readScannedFile(root: string, relPath: string): Promise<ScannedFile | null> {
-	// Skip files with sensitive names entirely
 	if (isSensitiveFile(relPath)) return null;
 
 	const absPath = join(root, relPath);
 	try {
 		const fileStat = await stat(absPath);
-		if (fileStat.size > 500_000) return null; // Skip files > 500KB
+		if (fileStat.size > 500_000) return null;
 
 		let raw = await readFile(absPath, "utf-8");
-
-		// Sanitize any embedded secrets from the content
 		const sanitized = sanitizeFileContent(relPath, raw);
-		if (sanitized === null) return null; // File determined to be sensitive
+		if (sanitized === null) return null;
 		raw = sanitized;
 
 		const lines = raw.split("\n").length;
@@ -108,110 +129,19 @@ async function readScannedFile(root: string, relPath: string): Promise<ScannedFi
 // Classification
 // ---------------------------------------------------------------------------
 
-/** Determine the programming language from a file extension. */
 function detectLanguage(ext: string): string {
-	const langMap: Record<string, string> = {
-		".ts": "TypeScript",
-		".tsx": "TypeScript (React)",
-		".js": "JavaScript",
-		".jsx": "JavaScript (React)",
-		".py": "Python",
-		".rb": "Ruby",
-		".go": "Go",
-		".rs": "Rust",
-		".java": "Java",
-		".kt": "Kotlin",
-		".swift": "Swift",
-		".c": "C",
-		".cpp": "C++",
-		".h": "C/C++ Header",
-		".hpp": "C++ Header",
-		".cs": "C#",
-		".php": "PHP",
-		".scala": "Scala",
-		".ex": "Elixir",
-		".exs": "Elixir",
-		".erl": "Erlang",
-		".hs": "Haskell",
-		".lua": "Lua",
-		".r": "R",
-		".R": "R",
-		".sql": "SQL",
-		".sh": "Shell",
-		".bash": "Shell",
-		".zsh": "Shell",
-		".fish": "Shell",
-		".ps1": "PowerShell",
-		".html": "HTML",
-		".htm": "HTML",
-		".xml": "XML",
-		".json": "JSON",
-		".yaml": "YAML",
-		".yml": "YAML",
-		".toml": "TOML",
-		".md": "Markdown",
-		".css": "CSS",
-		".scss": "SCSS",
-		".less": "LESS",
-		".graphql": "GraphQL",
-		".gql": "GraphQL",
-		".proto": "Protocol Buffers",
-		".tf": "Terraform",
-		".dart": "Dart",
-		".vue": "Vue",
-		".svelte": "Svelte",
+	const map: Record<string, string> = {
+		".ts": "TypeScript", ".tsx": "TypeScript (React)", ".js": "JavaScript", ".jsx": "JavaScript (React)",
+		".py": "Python", ".rb": "Ruby", ".go": "Go", ".rs": "Rust", ".java": "Java", ".kt": "Kotlin",
+		".swift": "Swift", ".c": "C", ".cpp": "C++", ".cs": "C#", ".php": "PHP", ".scala": "Scala",
+		".ex": "Elixir", ".exs": "Elixir", ".erl": "Erlang", ".hs": "Haskell", ".lua": "Lua",
+		".r": "R", ".sql": "SQL", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+		".html": "HTML", ".xml": "XML", ".json": "JSON", ".yaml": "YAML", ".yml": "YAML",
+		".toml": "TOML", ".md": "Markdown", ".css": "CSS", ".scss": "SCSS", ".less": "LESS",
+		".graphql": "GraphQL", ".proto": "Protocol Buffers", ".tf": "Terraform", ".dart": "Dart",
+		".vue": "Vue", ".svelte": "Svelte",
 	};
-	return langMap[ext] || "Unknown";
-}
-
-/** Extract exports/symbols from source code (best-effort). */
-function extractExports(content: string, language: string): string[] {
-	const exports: string[] = [];
-	const patterns: RegExp[] = [];
-
-	if (language.includes("TypeScript") || language.includes("JavaScript")) {
-		patterns.push(
-			/(?:export\s+(?:default\s+)?(?:function|class|const|let|var|interface|type|enum)\s+)(\w+)/g,
-			/(?:export\s+\{[^}]*\})/g,
-			/module\.exports\s*=\s*\{([^}]*)\}/g,
-		);
-	} else if (language === "Python") {
-		patterns.push(/^class\s+(\w+)/gm, /^def\s+(\w+)/gm);
-	} else if (language === "Go") {
-		patterns.push(/^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)/gm, /^type\s+(\w+)/gm);
-	} else if (language === "Rust") {
-		patterns.push(/pub\s+(?:async\s+)?fn\s+(\w+)/g, /pub\s+(?:struct|enum|trait|type)\s+(\w+)/g);
-	}
-
-	for (const pattern of patterns) {
-		let match: RegExpExecArray | null;
-		while ((match = pattern.exec(content)) !== null) {
-			if (match[1]) exports.push(match[1]);
-		}
-	}
-
-	return [...new Set(exports)].slice(0, 30); // Cap at 30
-}
-
-/** Extract imports/dependencies from source (best-effort). */
-function extractImports(content: string, language: string): string[] {
-	const imports: string[] = [];
-
-	if (language.includes("TypeScript") || language.includes("JavaScript")) {
-		const pattern = /(?:import|require)\s*\(?['"]([^'"]+)['"]/g;
-		let match: RegExpExecArray | null;
-		while ((match = pattern.exec(content)) !== null) {
-			imports.push(match[1]);
-		}
-	} else if (language === "Python") {
-		const pattern = /^(?:from|import)\s+([^\s.]+)/gm;
-		let match: RegExpExecArray | null;
-		while ((match = pattern.exec(content)) !== null) {
-			imports.push(match[1]);
-		}
-	}
-
-	return [...new Set(imports)].slice(0, 20);
+	return map[ext] || "Unknown";
 }
 
 /** Classify a file into a category with a grouping key. */
@@ -220,7 +150,6 @@ function classifyFile(file: ScannedFile): FileClassification {
 	const filename = basename(file.relativePath).toLowerCase();
 	const dirParts = dirname(file.relativePath).split("/");
 
-	// Check filename-based categories first
 	for (const [pattern, category] of Object.entries(FILENAME_CATEGORY_MAP)) {
 		if (filename === pattern.toLowerCase() || basenameNoExt === pattern.toLowerCase()) {
 			return { category, priority: 10, groupKey: dirParts.join("/") };
@@ -230,75 +159,39 @@ function classifyFile(file: ScannedFile): FileClassification {
 		}
 	}
 
-	// Check extension-based categories
 	const extCategory = EXTENSION_CATEGORY_MAP[file.extension];
 	if (extCategory) {
 		return { category: extCategory, priority: 5, groupKey: dirParts.join("/") };
 	}
 
-	// Test file heuristic
 	if (basenameNoExt.includes(".test") || basenameNoExt.includes(".spec") || basenameNoExt.includes("_test")) {
 		return { category: "testing", priority: 8, groupKey: dirParts.join("/") };
 	}
 
-	// Script heuristic
 	if (file.extension === ".sh" || file.extension === ".bash" || file.extension === ".py") {
 		const isScript = dirParts.some((d) => d === "scripts" || d === "bin" || d === "tools");
 		if (isScript) return { category: "scripts", priority: 7, groupKey: dirParts.join("/") };
 	}
 
-	// Language-based source classification
 	const lang = detectLanguage(file.extension);
 	if (
-		lang.includes("TypeScript") ||
-		lang.includes("JavaScript") ||
-		lang === "Python" ||
-		lang === "Go" ||
-		lang === "Rust" ||
-		lang === "Ruby" ||
-		lang === "Java" ||
-		lang === "Kotlin" ||
-		lang === "Swift" ||
-		lang === "PHP" ||
-		lang === "C#" ||
-		lang.includes("C++") ||
-		lang === "C" ||
-		lang === "Dart" ||
-		lang === "Scala"
+		lang.includes("TypeScript") || lang.includes("JavaScript") || lang === "Python" ||
+		lang === "Go" || lang === "Rust" || lang === "Ruby" || lang === "Java" ||
+		lang === "Kotlin" || lang === "Swift" || lang === "PHP" || lang === "C#" ||
+		lang.includes("C++") || lang === "C" || lang === "Dart" || lang === "Scala"
 	) {
 		return { category: "module", priority: 3, groupKey: dirParts.join("/") };
 	}
 
-	// Documentation
 	if (file.extension === ".md") {
 		return { category: "documentation", priority: 4, groupKey: dirParts.join("/") };
 	}
 
-	// API routes heuristic
-	if (
-		dirParts.some(
-			(d) =>
-				d === "routes" ||
-				d === "api" ||
-				d === "controllers" ||
-				d === "handlers" ||
-				d === "resolvers",
-		)
-	) {
+	if (dirParts.some((d) => d === "routes" || d === "api" || d === "controllers" || d === "handlers" || d === "resolvers")) {
 		return { category: "api", priority: 6, groupKey: "api" };
 	}
 
-	// Data model heuristic
-	if (
-		dirParts.some(
-			(d) =>
-				d === "models" ||
-				d === "entities" ||
-				d === "schemas" ||
-				d === "migrations" ||
-				d === "prisma",
-		)
-	) {
+	if (dirParts.some((d) => d === "models" || d === "entities" || d === "schemas" || d === "migrations" || d === "prisma")) {
 		return { category: "data-model", priority: 6, groupKey: "data-model" };
 	}
 
@@ -306,41 +199,18 @@ function classifyFile(file: ScannedFile): FileClassification {
 }
 
 // ---------------------------------------------------------------------------
-// Entry generation
+// Knowledge-based content generation
 // ---------------------------------------------------------------------------
 
-function truncateContent(content: string, maxLines: number): string {
-	const lines = content.split("\n");
-	if (lines.length <= maxLines) return content;
-	return lines.slice(0, maxLines).join("\n") + `\n... (${lines.length - maxLines} more lines)`;
-}
-
-/** Build a short one-line description summarising the file. */
-function buildDescription(file: ScannedFile, language: string, exports: string[]): string {
-	const name = basename(file.relativePath);
-
-	if (exports.length > 0) {
-		const topExports = exports.slice(0, 5).join(", ");
-		return `${language} file — exports: ${topExports}${exports.length > 5 ? `, +${exports.length - 5} more` : ""}`;
-	}
-
-	if (file.lines <= 20) {
-		return `${language} file (${file.lines} lines) — small utility/config file`;
-	}
-
-	return `${language} file (${file.lines} lines) — see content for details`;
-}
-
-/** Generate a clean, readable filename from a group key.
- *  e.g. "general:." → "general.md", "module:extensions/src" → "module_extensions_src.md" */
+/** Generate a clean, readable filename from a group key. */
 function pathToFilename(groupKey: string): string {
 	const cleaned = groupKey
-		.replace(/[:/\\]/g, "_")           // separators → underscore
-		.replace(/_\./g, "_")              // "_." → "_"  (e.g. "general_." → "general_")
-		.replace(/\.+/g, ".")              // collapse multiple dots
-		.replace(/_+/g, "_")              // collapse multiple underscores
-		.replace(/(^_|_$|\.$)/g, "")      // strip leading/trailing _ or .
-		.replace(/_\./g, "_");             // clean any remaining "_." artifacts
+		.replace(/[:/\\]/g, "_")
+		.replace(/_\./g, "_")
+		.replace(/\.+/g, ".")
+		.replace(/_+/g, "_")
+		.replace(/(^_|_$|\.$)/g, "")
+		.replace(/_\./g, "_");
 	return (cleaned || "general") + ".md";
 }
 
@@ -349,142 +219,171 @@ export function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
-// ---------------------------------------------------------------------------
-// AI-friendly content generators
-// ---------------------------------------------------------------------------
-
-/** Generate a concise one-line purpose for a file. */
-function generateFilePurpose(file: ScannedFile, language: string, exports: string[]): string {
-	// Extract the first JSDoc / doc-comment summary from the file
-	const docMatch = file.content.match(/\/\*\*[\s*]*([^(\*\/)]*?\S)[\s*]*\*\//);
-	if (docMatch) {
-		const summary = docMatch[1].replace(/\n/g, " ").trim();
-		if (summary.length > 5 && summary.length < 120) return summary;
-	}
-
-	// Multi-line doc comment
-	const multiDocMatch = file.content.match(/\/\*\*[\s\S]*?\*\//);
-	if (multiDocMatch) {
-		const body = multiDocMatch[0]
-			.replace(/\/\*\*?|\*\/?/g, "")
-			.replace(/^\s*\*\s?/gm, "")
-			.split("\n")
-			.map((l: string) => l.trim())
-			.find((l: string) => l.length > 5 && !l.startsWith("@") && !l.startsWith("{"));
-		if (body && body.length < 120) return body;
-	}
-
-	// Fallback: use exports
-	if (exports.length > 0) {
-		return `Exports: ${exports.slice(0, 3).join(", ")}`;
-	}
-
-	return `${language} ${file.extension} file`;
+/** Generate an entry description from the first file's doc comment or purpose. */
+function buildEntryDescription(
+	category: KbCategory,
+	firstFile: ScannedFile,
+	fileKnowledges: FileKnowledge[],
+): string {
+	// Use the extractor's description generator
+	const merged = mergeKnowledge(fileKnowledges);
+	return generateDescription(merged, category);
 }
 
-/** Generate an overview paragraph for a group of files. */
-function generateOverview(
+/** Generate the markdown body for a knowledge base entry. */
+function generateEntryContent(
 	category: KbCategory,
-	files: ScannedFile[],
-	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
+	groupKey: string,
+	fileKnowledges: FileKnowledge[],
 	dirPart: string,
 ): string {
-	const parts: string[] = [];
+	const merged = mergeKnowledge(fileKnowledges);
+	const sections: string[] = [];
 
-	if (files.length === 1) {
-		const s = summaries[0];
-		parts.push(`\`${s.file.relativePath}\` — ${generateFilePurpose(s.file, s.lang, s.exports)}.`);
+	// --- Purpose ---
+	if (merged.purpose) {
+		sections.push(`## Purpose\n`);
+		sections.push(merged.purpose);
+		sections.push("");
+	}
+
+	// --- File Summary (compact) ---
+	if (fileKnowledges.length === 1) {
+		sections.push(`## Source\n`);
+		sections.push(`\`${fileKnowledges[0].file.relativePath}\` (${fileKnowledges[0].file.lines} lines, ${detectLanguage(fileKnowledges[0].file.extension)})`);
+		sections.push("");
 	} else {
-		parts.push(`${files.length} files in \`${dirPart || "root"}\`.`);
-
-		// Summarize the main responsibilities
-		const responsibilities = new Set<string>();
-		for (const s of summaries) {
-			const purpose = generateFilePurpose(s.file, s.lang, s.exports);
-			if (purpose.length > 10) responsibilities.add(purpose);
+		sections.push(`## Files (${fileKnowledges.length})\n`);
+		for (const fk of fileKnowledges) {
+			const purpose = fk.purpose || detectLanguage(fk.file.extension) + " file";
+			sections.push(`- \`${fk.file.relativePath}\` (${fk.file.lines} lines) — ${purpose.length > 100 ? purpose.slice(0, 97) + "..." : purpose}`);
 		}
-		if (responsibilities.size > 0 && responsibilities.size <= 5) {
-			parts.push("Main responsibilities:");
-			for (const r of responsibilities) {
-				parts.push(`- ${r}`);
-			}
-		}
+		sections.push("");
 	}
 
-	return parts.join("\n");
-}
-
-/** Extract key function signatures and patterns for architecture notes. */
-function extractArchitectureNotes(
-	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
-): string {
-	const notes: string[] = [];
-
-	for (const { file: f, lang, exports } of summaries) {
-		// Only extract from source code files
-		if (!lang.includes("TypeScript") && !lang.includes("JavaScript") && lang !== "Python") continue;
-
-		// Extract top-level function signatures (name + params, no body)
-		const funcSigs: string[] = [];
-		const funcPattern = /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
-		let match: RegExpExecArray | null;
-		while ((match = funcPattern.exec(f.content)) !== null) {
-			const name = match[1];
-			const params = match[2].trim();
-			if (params.length > 60) continue; // Skip overly verbose signatures
-			funcSigs.push(`\`${name}(${params || ""})\``);
+	// --- Responsibilities ---
+	if (merged.responsibilities.length > 0) {
+		sections.push("## Responsibilities\n");
+		for (const r of merged.responsibilities.slice(0, 8)) {
+			sections.push(`- ${r}`);
 		}
-
-		// Extract exported type/interface names
-		const typeExports: string[] = [];
-		const typePattern = /export\s+(?:type|interface)\s+(\w+)/g;
-		while ((match = typePattern.exec(f.content)) !== null) {
-			typeExports.push(match[1]);
-		}
-
-		if (funcSigs.length > 0 || typeExports.length > 0) {
-			const sigs = funcSigs.slice(0, 5).join(", ");
-			const types = typeExports.length > 0 ? `Types: ${typeExports.slice(0, 5).join(", ")}` : "";
-			notes.push(`**${f.relativePath}**: ${sigs}${types ? " | " + types : ""}`);
-		}
+		sections.push("");
 	}
 
-	return notes.join("\n");
+	// --- Key Concepts ---
+	if (merged.keyConcepts.length > 0) {
+		sections.push("## Key Concepts\n");
+		for (const kc of merged.keyConcepts.slice(0, 10)) {
+			sections.push(`- ${kc}`);
+		}
+		sections.push("");
+	}
+
+	// --- API Surface ---
+	if (merged.apiSurface.length > 0) {
+		sections.push("## API Surface\n");
+		for (const api of merged.apiSurface.slice(0, 10)) {
+			sections.push(`- ${api}`);
+		}
+		sections.push("");
+	}
+
+	// --- Data Flow ---
+	if (merged.dataFlow.length > 0) {
+		sections.push("## Data Flow\n");
+		for (const df of merged.dataFlow.slice(0, 6)) {
+			sections.push(`- ${df}`);
+		}
+		sections.push("");
+	}
+
+	// --- Patterns ---
+	if (merged.patterns.length > 0) {
+		sections.push("## Patterns\n");
+		for (const p of merged.patterns) {
+			sections.push(`- ${p}`);
+		}
+		sections.push("");
+	}
+
+	// --- Configuration ---
+	if (merged.configuration.length > 0) {
+		sections.push("## Configuration\n");
+		for (const c of merged.configuration.slice(0, 8)) {
+			sections.push(`- ${c}`);
+		}
+		sections.push("");
+	}
+
+	// --- Dependencies ---
+	if (merged.dependencyPurposes.length > 0) {
+		sections.push("## Dependencies\n");
+		for (const dep of merged.dependencyPurposes.slice(0, 10)) {
+			sections.push(`- ${dep}`);
+		}
+		sections.push("");
+	}
+
+	// --- Error Handling ---
+	if (merged.errorHandling.length > 0) {
+		sections.push("## Error Handling\n");
+		for (const eh of merged.errorHandling) {
+			sections.push(`- ${eh}`);
+		}
+		sections.push("");
+	}
+
+	// --- Constraints ---
+	if (merged.constraints.length > 0) {
+		sections.push("## Constraints\n");
+		for (const c of merged.constraints) {
+			sections.push(`- ${c}`);
+		}
+		sections.push("");
+	}
+
+	// --- Agent guidance ---
+	sections.push("## When to Reference\n");
+	sections.push(generateAgentUsage(category, dirPart, merged));
+	sections.push("");
+
+	return sections.join("\n");
 }
 
-/** Generate agent usage instructions for a KB entry. */
+/** Generate agent usage instructions for a KB entry based on extracted knowledge. */
 function generateAgentUsage(
 	category: KbCategory,
-	title: string,
-	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
 	dirPart: string,
+	knowledge: ExtractedKnowledge,
 ): string {
 	const instructions: string[] = [];
 	instructions.push("> 🤖 **Agent guidance**: Consult this entry when you need to:");
 
 	switch (category) {
 		case "module":
-			instructions.push(`- Understand the implementation in \`${dirPart || "root"}\``);
-			instructions.push("- Find where a function or type is defined");
-			instructions.push("- Understand module dependencies and exports");
+			instructions.push(`- Understand what the \`${dirPart || "root"}\` module does and why`);
+			instructions.push("- Find where a function or type is defined and how it works");
+			instructions.push("- Understand the module's responsibilities and API surface");
+			if (knowledge.dataFlow.length > 0) instructions.push("- Trace data flow through this module");
+			if (knowledge.patterns.length > 0) instructions.push("- Understand design patterns used here");
 			break;
 		case "api":
 			instructions.push("- Find API endpoints, routes, or handlers");
-			instructions.push("- Understand request/response patterns");
+			instructions.push("- Understand request/response patterns and data flow");
 			instructions.push("- Locate middleware or authentication logic");
 			break;
 		case "config":
-			instructions.push("- Check project configuration options");
-			instructions.push("- Understand build or tool settings");
+			instructions.push("- Check project configuration options and their effects");
+			instructions.push("- Understand build or tool settings and dependencies");
 			break;
 		case "testing":
-			instructions.push("- Understand test coverage and patterns");
+			instructions.push("- Understand test coverage and what behaviors are tested");
 			instructions.push("- Find test utilities or fixtures");
 			instructions.push("- Write new tests following existing patterns");
 			break;
 		case "build":
-			instructions.push("- Understand build scripts and dependencies");
-			instructions.push("- Modify package configuration");
+			instructions.push("- Understand build scripts, dependencies, and how to build");
+			instructions.push("- Modify package configuration or scripts");
 			break;
 		case "documentation":
 			instructions.push("- Find user-facing docs or README content");
@@ -492,14 +391,13 @@ function generateAgentUsage(
 			break;
 		case "data-model":
 			instructions.push("- Understand database schemas or data structures");
-			instructions.push("- Find model definitions or migrations");
+			instructions.push("- Find model definitions, types, or migrations");
 			break;
 		case "architecture":
-			instructions.push("- Understand high-level design decisions");
-			instructions.push("- Get an overview of system structure");
+			instructions.push("- Understand high-level design decisions and system structure");
 			break;
 		default:
-			instructions.push(`- Look up details about the ${title} area`);
+			instructions.push(`- Look up details about the ${dirPart || "project"} area`);
 			instructions.push("- Find file locations or configuration");
 			break;
 	}
@@ -518,13 +416,43 @@ export interface ScanResult {
 }
 
 /** Scan the codebase and generate knowledge base entries. */
-export async function scanCodebase(cwd: string, config: KbConfig): Promise<ScanResult> {
+export async function scanCodebase(
+	cwd: string,
+	config: KbConfig,
+	onProgress?: ProgressCallback,
+): Promise<ScanResult> {
 	const allIgnore = [...DEFAULT_IGNORE_PATTERNS, ...config.ignorePatterns];
 	const fileHashes: Record<string, string> = {};
 	const fileMap = new Map<string, ScannedFile>();
 
-	// Walk and read all files
+	// --- Phase 1: Walk files ---
+	onProgress?.({ phase: "walking", message: "Scanning directory structure...", processed: 0, total: 0 });
+
+	const filePaths: string[] = [];
 	for await (const relPath of walkDir(cwd, "", allIgnore, config.includeExtensions)) {
+		filePaths.push(relPath);
+	}
+
+	// --- Phase 2: Read files ---
+	onProgress?.({
+		phase: "reading",
+		message: `Reading ${filePaths.length} files...`,
+		processed: 0,
+		total: filePaths.length,
+	});
+
+	let readCount = 0;
+	for (const relPath of filePaths) {
+		readCount++;
+		if (readCount % 25 === 0 || readCount === filePaths.length) {
+			onProgress?.({
+				phase: "reading",
+				message: `Reading files... (${readCount}/${filePaths.length})`,
+				processed: readCount,
+				total: filePaths.length,
+			});
+		}
+
 		const scanned = await readScannedFile(cwd, relPath);
 		if (scanned) {
 			fileMap.set(relPath, scanned);
@@ -532,19 +460,24 @@ export async function scanCodebase(cwd: string, config: KbConfig): Promise<ScanR
 		}
 	}
 
-	// Group files by classification
+	// --- Phase 3: Classify ---
+	onProgress?.({
+		phase: "classifying",
+		message: `Classifying ${fileMap.size} files...`,
+		processed: 0,
+		total: fileMap.size,
+	});
+
 	const groups = new Map<string, { files: ScannedFile[]; category: KbCategory }>();
 
 	for (const file of fileMap.values()) {
 		const classification = classifyFile(file);
 
-		// For modules, group by directory to create directory-level entries
 		let groupKey: string;
 		if (classification.category === "module" || classification.category === "general") {
 			const dir = dirname(file.relativePath);
 			groupKey = `${classification.category}:${dir || "."}`;
 		} else if (classification.category === "documentation" && file.extension === ".md") {
-			// Each doc file gets its own entry
 			groupKey = `doc:${file.relativePath}`;
 		} else {
 			groupKey = `${classification.category}:${classification.groupKey}`;
@@ -556,16 +489,57 @@ export async function scanCodebase(cwd: string, config: KbConfig): Promise<ScanR
 		groups.get(groupKey)!.files.push(file);
 	}
 
-	// Generate entries
-	const entries: KbEntry[] = [];
-	let entryCount = 0;
+	// --- Phase 4: Extract knowledge ---
+	onProgress?.({
+		phase: "extracting",
+		message: `Extracting knowledge from ${groups.size} groups...`,
+		processed: 0,
+		total: groups.size,
+	});
 
-	for (const [groupKey, group] of groups) {
+	// Extract knowledge per file, then group
+	const fileKnowledgeMap = new Map<string, FileKnowledge>();
+	let extractCount = 0;
+	for (const file of fileMap.values()) {
+		extractCount++;
+		if (extractCount % 15 === 0 || extractCount === fileMap.size) {
+			onProgress?.({
+				phase: "extracting",
+				message: `Extracting knowledge... (${extractCount}/${fileMap.size} files)`,
+				processed: extractCount,
+				total: fileMap.size,
+			});
+		}
+		fileKnowledgeMap.set(file.relativePath, extractFileKnowledge(file));
+	}
+
+	// --- Phase 5: Generate entries ---
+	onProgress?.({
+		phase: "generating",
+		message: `Generating ${groups.size} knowledge entries...`,
+		processed: 0,
+		total: groups.size,
+	});
+
+	const entries: KbEntry[] = [];
+	const groupEntries = [...groups.entries()];
+
+	for (let gi = 0; gi < groupEntries.length; gi++) {
+		const [groupKey, group] = groupEntries[gi];
+
+		if (gi % 5 === 0 || gi === groupEntries.length - 1) {
+			onProgress?.({
+				phase: "generating",
+				message: `Generating entries... (${gi + 1}/${groupEntries.length})`,
+				processed: gi + 1,
+				total: groupEntries.length,
+			});
+		}
+
 		const sortedFiles = [...group.files].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 
 		// For large groups, split into sub-entries
 		if (sortedFiles.length > 10) {
-			// Split into chunks of up to 8 files
 			const chunks: ScannedFile[][] = [];
 			for (let i = 0; i < sortedFiles.length; i += 8) {
 				chunks.push(sortedFiles.slice(i, i + 8));
@@ -573,14 +547,15 @@ export async function scanCodebase(cwd: string, config: KbConfig): Promise<ScanR
 
 			for (let ci = 0; ci < chunks.length; ci++) {
 				const chunk = chunks[ci];
-				const entry = generateEntry(group.category, groupKey, chunk, config, ci > 0 ? `-part${ci + 1}` : "");
+				const entry = generateEntry(
+					group.category, groupKey, chunk, config,
+					fileKnowledgeMap, ci > 0 ? `-part${ci + 1}` : "",
+				);
 				entries.push(entry);
-				entryCount++;
 			}
 		} else {
-			const entry = generateEntry(group.category, groupKey, sortedFiles, config);
+			const entry = generateEntry(group.category, groupKey, sortedFiles, config, fileKnowledgeMap);
 			entries.push(entry);
-			entryCount++;
 		}
 	}
 
@@ -592,6 +567,7 @@ function generateEntry(
 	groupKey: string,
 	files: ScannedFile[],
 	config: KbConfig,
+	fileKnowledgeMap: Map<string, FileKnowledge>,
 	suffix = "",
 ): KbEntry {
 	const firstFile = files[0];
@@ -607,7 +583,10 @@ function generateEntry(
 		title = category + suffix;
 	}
 
-	// Build tags
+	// Collect file knowledges
+	const fileKnowledges = files.map(f => fileKnowledgeMap.get(f.relativePath)!).filter(Boolean);
+
+	// Build tags from file types
 	const tags = new Set<string>();
 	tags.add(category);
 	for (const f of files) {
@@ -616,93 +595,29 @@ function generateEntry(
 		tags.add(f.extension.replace(".", "") || "plain");
 	}
 
-	// Collect all exports and imports across files
-	const allExports: string[] = [];
-	const allImports = new Set<string>();
-	const fileSummaries: { file: ScannedFile; lang: string; exports: string[] }[] = [];
-
-	for (const f of files) {
-		const lang = detectLanguage(f.extension);
-		const exports = extractExports(f.content, lang);
-		allExports.push(...exports);
-		fileSummaries.push({ file: f, lang, exports });
-		for (const imp of extractImports(f.content, lang)) {
-			if (!imp.startsWith(".")) allImports.add(imp);
-		}
-	}
-
-	// Build content sections — concise, AI-friendly format
-	const sections: string[] = [];
-
-	// Overview — AI-generated summary based on file analysis
-	sections.push("## Overview\n");
-	const overviewText = generateOverview(category, files, fileSummaries, dirPart);
-	sections.push(overviewText);
-	sections.push("");
-
-	// File table — compact reference
-	sections.push("## Files\n");
-	sections.push("| File | Lines | Purpose |");
-	sections.push("|------|-------|--------|");
-	for (const { file: f, lang, exports } of fileSummaries) {
-		const purpose = generateFilePurpose(f, lang, exports);
-		sections.push(`| \`${f.relativePath}\` | ${f.lines} | ${purpose} |`);
-	}
-	sections.push("");
-
-	// Key exports (only if present)
-	const uniqueExports = [...new Set(allExports)];
-	if (uniqueExports.length > 0) {
-		sections.push("## Key Exports\n");
-		for (const exp of uniqueExports.slice(0, 10)) {
-			sections.push(`- \`${exp}\``);
-		}
-		sections.push("");
-	}
-
-	// Dependencies (only external ones, compact)
-	if (allImports.size > 0) {
-		sections.push("## Dependencies\n");
-		sections.push([...allImports].slice(0, 10).map((imp) => `\`${imp}\``).join(", "));
-		sections.push("");
-	}
-
-	// Architecture notes — extract function signatures and key patterns
-	const archNotes = extractArchitectureNotes(fileSummaries);
-	if (archNotes) {
-		sections.push("## Architecture\n");
-		sections.push(archNotes);
-		sections.push("");
-	}
-
-	// Agent usage instructions
-	sections.push("## When to Reference\n");
-	sections.push(generateAgentUsage(category, title, fileSummaries, dirPart));
-	sections.push("");
-
-	const content = sections.join("\n");
-
-	// Build related files
+	// Build related from imports
 	const related: string[] = [];
-	for (const f of files) {
-		const lang = detectLanguage(f.extension);
-		const imports = extractImports(f.content, lang);
-		for (const imp of imports) {
-			if (imp.startsWith(".")) related.push(imp);
+	for (const fk of fileKnowledges) {
+		// Reuse import extraction for related entries
+		const lang = detectLanguage(fk.file.extension);
+		if (lang.includes("TypeScript") || lang.includes("JavaScript")) {
+			const importPattern = /(?:import|require)\s*\(?['"](\.\/[^'"]+)['"]/g;
+			let match: RegExpExecArray | null;
+			while ((match = importPattern.exec(fk.file.content)) !== null) {
+				related.push(match[1]);
+			}
 		}
 	}
 
-	// Description — concise, meaningful
-	const languages = new Set(files.map((f) => detectLanguage(f.extension)));
-	const langStr = [...languages].join(", ");
-	let description: string;
-	if (files.length === 1) {
-		const lang = detectLanguage(firstFile.extension);
-		const exports = extractExports(firstFile.content, lang);
-		description = buildDescription(firstFile, lang, exports);
-	} else {
-		description = `${category} — ${files.length} files (${langStr}) in ${dirPart || "root"}`;
-	}
+	// Generate description using knowledge extractor
+	const description = fileKnowledges.length > 0
+		? buildEntryDescription(category, firstFile, fileKnowledges)
+		: `${category} — ${files.length} files in ${dirPart || "root"}`;
+
+	// Generate content using knowledge extractor
+	const content = fileKnowledges.length > 0
+		? generateEntryContent(category, groupKey, fileKnowledges, dirPart)
+		: generateFallbackContent(category, files, dirPart);
 
 	const filename = pathToFilename(groupKey);
 
@@ -717,6 +632,25 @@ function generateEntry(
 	};
 
 	return { filename, frontmatter, content };
+}
+
+/** Minimal fallback when knowledge extraction fails or returns nothing useful. */
+function generateFallbackContent(
+	category: KbCategory,
+	files: ScannedFile[],
+	dirPart: string,
+): string {
+	const parts: string[] = [];
+	parts.push(`## Files (${files.length})\n`);
+	for (const f of files) {
+		const lang = detectLanguage(f.extension);
+		parts.push(`- \`${f.relativePath}\` (${f.lines} lines, ${lang})`);
+	}
+	parts.push("");
+	parts.push("## When to Reference\n");
+	parts.push(`> 🤖 **Agent guidance**: Consult this entry when you need to find files in \`${dirPart || "root"}\`.`);
+	parts.push("");
+	return parts.join("\n");
 }
 
 /** Quick-scan only files that changed since the last hash map. */

@@ -15,7 +15,7 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import { join, basename } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { loadConfig } from "./src/config.js";
-import { scanCodebase, scanChangedFiles } from "./src/scanner.js";
+import { scanCodebase, scanChangedFiles, type ScanProgress } from "./src/scanner.js";
 import {
 	KB_DIR,
 	kbExists,
@@ -68,6 +68,44 @@ async function getChangedFilesSince(
 }
 
 // ---------------------------------------------------------------------------
+// Progress UI helpers
+// ---------------------------------------------------------------------------
+
+/** Spinner frames for the status line. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Create a progress callback that updates ctx.ui.setStatus with a spinner. */
+function createProgressNotifier(ctx: any): (progress: ScanProgress) => void {
+	let frameIndex = 0;
+
+	const phaseLabels: Record<ScanProgress["phase"], string> = {
+		walking: "Scanning directories",
+		reading: "Reading files",
+		classifying: "Classifying files",
+		extracting: "Extracting knowledge",
+		generating: "Generating entries",
+		writing: "Writing knowledge base",
+	};
+
+	return (progress: ScanProgress) => {
+		const frame = SPINNER_FRAMES[frameIndex % SPINNER_FRAMES.length];
+		frameIndex++;
+
+		const phaseLabel = phaseLabels[progress.phase] || progress.phase;
+		let detail = "";
+
+		if (progress.total > 0) {
+			const pct = Math.round((progress.processed / progress.total) * 100);
+			detail = ` (${progress.processed}/${progress.total} — ${pct}%)`;
+		} else if (progress.processed > 0) {
+			detail = ` (${progress.processed} files)`;
+		}
+
+		ctx.ui.setStatus("md-knowledge", `${frame} ${phaseLabel}${detail}: ${progress.message}`);
+	};
+}
+
+// ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
@@ -84,11 +122,15 @@ async function handleInit(pi: ExtensionAPI, cwd: string, ctx: any): Promise<void
 		}
 	}
 
-	ctx.ui.setStatus("md-knowledge", "Scanning codebase...");
+	ctx.ui.setStatus("md-knowledge", "⠋ Initializing knowledge base...");
 
 	const config = await loadConfig(cwd);
-	const { entries, fileHashes, totalFilesScanned } = await scanCodebase(cwd, config);
+	const onProgress = createProgressNotifier(ctx);
+
+	const { entries, fileHashes, totalFilesScanned } = await scanCodebase(cwd, config, onProgress);
 	const lastCommit = await getHeadCommit(cwd, pi.exec);
+
+	ctx.ui.setStatus("md-knowledge", "⠋ Writing knowledge base to disk...");
 
 	const result = await writeKnowledgeBase(cwd, entries, fileHashes, lastCommit);
 
@@ -99,12 +141,12 @@ async function handleInit(pi: ExtensionAPI, cwd: string, ctx: any): Promise<void
 		.join(", ");
 
 	ctx.ui.notify(
-		`Knowledge base created!\n` +
-			`  Files scanned: ${result.filesScanned}\n` +
-			`  Entries created: ${result.entriesCreated}\n` +
-			`  Categories: ${catList}\n` +
-			`  Duration: ${result.durationMs}ms\n` +
-			`  Location: .kb/`,
+		`✅ Knowledge base created!\n` +
+			`  📁 Files scanned: ${result.filesScanned}\n` +
+			`  📝 Entries created: ${result.entriesCreated}\n` +
+			`  🏷️ Categories: ${catList}\n` +
+			`  ⏱️ Duration: ${result.durationMs}ms\n` +
+			`  📍 Location: .kb/`,
 		"info",
 	);
 }
@@ -121,7 +163,7 @@ async function handleUpdate(pi: ExtensionAPI, cwd: string, ctx: any): Promise<vo
 		return;
 	}
 
-	ctx.ui.setStatus("md-knowledge", "Detecting changes...");
+	ctx.ui.setStatus("md-knowledge", "⠋ Detecting changes...");
 
 	const config = await loadConfig(cwd);
 
@@ -148,10 +190,14 @@ async function handleUpdate(pi: ExtensionAPI, cwd: string, ctx: any): Promise<vo
 		return;
 	}
 
-	ctx.ui.setStatus("md-knowledge", `Updating ${allChanged.size} changed, ${removed.length} removed...`);
+	ctx.ui.setStatus(
+		"md-knowledge",
+		`⠋ Updating: ${allChanged.size} changed, ${removed.length} removed...`,
+	);
 
 	// Re-scan fully to regenerate entries
-	const { entries, fileHashes, totalFilesScanned } = await scanCodebase(cwd, config);
+	const onProgress = createProgressNotifier(ctx);
+	const { entries, fileHashes, totalFilesScanned } = await scanCodebase(cwd, config, onProgress);
 	const lastCommit = await getHeadCommit(cwd, pi.exec);
 
 	// Determine which entries to remove (files that no longer exist)
@@ -163,21 +209,21 @@ async function handleUpdate(pi: ExtensionAPI, cwd: string, ctx: any): Promise<vo
 		if (entry) {
 			const sourceExists = entry.frontmatter.sourceFiles.some((sf) => allChanged.has(sf) || removed.includes(sf));
 			if (sourceExists || entry.frontmatter.sourceFiles.every((sf) => removed.includes(sf))) {
-				// This entry touches changed or removed files — it will be regenerated
 				entriesToRemove.push(entryFile);
 			}
 		}
 	}
 
+	ctx.ui.setStatus("md-knowledge", "⠋ Writing updated entries...");
 	const result = await updateKnowledgeBase(cwd, entries, fileHashes, entriesToRemove, lastCommit);
 
 	ctx.ui.setStatus("md-knowledge", undefined);
 	ctx.ui.notify(
-		`Knowledge base updated!\n` +
-			`  Files scanned: ${result.filesScanned}\n` +
-			`  Entries updated: ${result.entriesUpdated}\n` +
-			`  Entries removed: ${result.entriesRemoved}\n` +
-			`  Duration: ${result.durationMs}ms`,
+		`✅ Knowledge base updated!\n` +
+			`  📁 Files scanned: ${result.filesScanned}\n` +
+			`  📝 Entries updated: ${result.entriesUpdated}\n` +
+			`  🗑️ Entries removed: ${result.entriesRemoved}\n` +
+			`  ⏱️ Duration: ${result.durationMs}ms`,
 		"info",
 	);
 }
@@ -319,9 +365,9 @@ async function handleAdd(pi: ExtensionAPI, cwd: string, ctx: any): Promise<void>
 		await writeFile(join(kbDir, "state.json"), JSON.stringify(state, null, 2), "utf-8");
 	}
 
-	const redactionMsg = redactionCount > 0 ? `\n  ⚠ ${redactionCount} potential secret(s) redacted` : "";
+	const redactionMsg = redactionCount > 0 ? `\n  ⚠️ ${redactionCount} potential secret(s) redacted` : "";
 	ctx.ui.notify(
-		`${created ? "Created" : "Updated"} entry: ${filename}${redactionMsg}`,
+		`${created ? "✅ Created" : "✅ Updated"} entry: ${filename}${redactionMsg}`,
 		"info",
 	);
 }
@@ -454,8 +500,8 @@ export default function mdKnowledgeExtension(pi: ExtensionAPI) {
 					if (sf.toLowerCase().includes(query)) score += 4;
 				}
 
-				// Description match
-				if (fm.description.toLowerCase().includes(query)) score += 3;
+				// Description match (high weight — descriptions now contain real knowledge)
+				if (fm.description.toLowerCase().includes(query)) score += 6;
 
 				// Content match
 				if (entry.content.toLowerCase().includes(query)) score += 2;
