@@ -179,7 +179,13 @@ function extractTsJsKnowledge(file: ScannedFile): ExtractedKnowledge {
 	// --- Purpose from module description ---
 	const moduleDesc = extractModuleDescription(content, "typescript");
 	if (moduleDesc) {
-		knowledge.purpose = moduleDesc.split(".")[0] + "."; // First sentence
+		// Take the first meaningful sentence only, cleaned up
+		let firstSentence = moduleDesc.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+		const periodIdx = firstSentence.indexOf(".");
+		if (periodIdx > 0 && periodIdx < 120) {
+			firstSentence = firstSentence.slice(0, periodIdx + 1);
+		}
+		knowledge.purpose = firstSentence;
 	}
 
 	// --- Key Concepts from types/interfaces ---
@@ -217,7 +223,8 @@ function extractTsJsKnowledge(file: ScannedFile): ExtractedKnowledge {
 	}
 
 	// --- Responsibilities from exported functions ---
-	const funcPattern = /\/\*\*([\s\S]*?)\*\/\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
+	// Note: only match doc comments directly attached to functions (no code lines in between)
+	const funcPattern = /\/\*\*((?:(?!\*\/)[^])*?)\*\/\n(?:\s*\n)?\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
 	while ((match = funcPattern.exec(content)) !== null) {
 		const docText = match[1].replace(/^\s*\*\s?/gm, "").trim();
 		const funcName = match[2];
