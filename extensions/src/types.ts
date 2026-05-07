@@ -106,8 +106,8 @@ export interface KbConfig {
 
 export const DEFAULT_CONFIG: KbConfig = {
 	ignorePatterns: [],
-	maxEntryLines: 80,
-	maxSourceLines: 40,
+	maxEntryLines: 200,
+	maxSourceLines: 100,
 	includeExtensions: [],
 	includeContent: true,
 };

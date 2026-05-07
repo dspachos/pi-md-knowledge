@@ -148,8 +148,8 @@ Create an optional `.kbrc.json` in your project root:
 ```json
 {
   "ignorePatterns": ["custom-dir", "generated"],
-  "maxEntryLines": 80,
-  "maxSourceLines": 40,
+  "maxEntryLines": 200,
+  "maxSourceLines": 100,
   "includeExtensions": [],
   "includeContent": true
 }
@@ -158,8 +158,8 @@ Create an optional `.kbrc.json` in your project root:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ignorePatterns` | `[]` | Additional directories/patterns to exclude |
-| `maxEntryLines` | `80` | Max lines per knowledge entry |
-| `maxSourceLines` | `40` | Max source lines to include per file |
+| `maxEntryLines` | `200` | Max lines per knowledge entry |
+| `maxSourceLines` | `100` | Max source lines to include per file |
 | `includeExtensions` | `[]` | Only include these file extensions (empty = all) |
 | `includeContent` | `true` | Include source code in entries (false = structure only) |
 
