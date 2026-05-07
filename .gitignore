@@ -3,4 +3,4 @@ dist/
 .kb/
 *.js
 *.d.ts
-!.pi/
+.pi

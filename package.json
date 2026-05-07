@@ -2,12 +2,22 @@
   "name": "pi-md-knowledge",
   "version": "1.0.0",
   "description": "Markdown knowledge base generator for pi coding agent. Scans your codebase and creates a navigable .kb folder of markdown documents for AI agents.",
-  "keywords": ["pi-package", "knowledge-base", "markdown", "ai-agent", "codebase-documentation"],
+  "keywords": [
+    "pi-package",
+    "knowledge-base",
+    "markdown",
+    "ai-agent",
+    "codebase-documentation"
+  ],
   "type": "module",
   "main": "extensions/index.ts",
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "scripts": {
     "clean": "rm -rf dist node_modules",
@@ -21,5 +31,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/dspachos/pi-md-knowledge"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
   }
 }

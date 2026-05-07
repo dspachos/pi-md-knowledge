@@ -331,14 +331,180 @@ function buildDescription(file: ScannedFile, language: string, exports: string[]
 	return `${language} file (${file.lines} lines) — see content for details`;
 }
 
-/** Generate a safe filename from a path. */
-function pathToFilename(relPath: string): string {
-	return relPath.replace(/[/\\]/g, "__").replace(/[^a-zA-Z0-9._-]/g, "_");
+/** Generate a clean, readable filename from a group key.
+ *  e.g. "general:." → "general.md", "module:extensions/src" → "module_extensions_src.md" */
+function pathToFilename(groupKey: string): string {
+	const cleaned = groupKey
+		.replace(/[:/\\]/g, "_")           // separators → underscore
+		.replace(/_\./g, "_")              // "_." → "_"  (e.g. "general_." → "general_")
+		.replace(/\.+/g, ".")              // collapse multiple dots
+		.replace(/_+/g, "_")              // collapse multiple underscores
+		.replace(/(^_|_$|\.$)/g, "")      // strip leading/trailing _ or .
+		.replace(/_\./g, "_");             // clean any remaining "_." artifacts
+	return (cleaned || "general") + ".md";
 }
 
 /** Compute a SHA-256 hash of file content for change detection. */
 export function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+// ---------------------------------------------------------------------------
+// AI-friendly content generators
+// ---------------------------------------------------------------------------
+
+/** Generate a concise one-line purpose for a file. */
+function generateFilePurpose(file: ScannedFile, language: string, exports: string[]): string {
+	// Extract the first JSDoc / doc-comment summary from the file
+	const docMatch = file.content.match(/\/\*\*[\s*]*([^(\*\/)]*?\S)[\s*]*\*\//);
+	if (docMatch) {
+		const summary = docMatch[1].replace(/\n/g, " ").trim();
+		if (summary.length > 5 && summary.length < 120) return summary;
+	}
+
+	// Multi-line doc comment
+	const multiDocMatch = file.content.match(/\/\*\*[\s\S]*?\*\//);
+	if (multiDocMatch) {
+		const body = multiDocMatch[0]
+			.replace(/\/\*\*?|\*\/?/g, "")
+			.replace(/^\s*\*\s?/gm, "")
+			.split("\n")
+			.map((l: string) => l.trim())
+			.find((l: string) => l.length > 5 && !l.startsWith("@") && !l.startsWith("{"));
+		if (body && body.length < 120) return body;
+	}
+
+	// Fallback: use exports
+	if (exports.length > 0) {
+		return `Exports: ${exports.slice(0, 3).join(", ")}`;
+	}
+
+	return `${language} ${file.extension} file`;
+}
+
+/** Generate an overview paragraph for a group of files. */
+function generateOverview(
+	category: KbCategory,
+	files: ScannedFile[],
+	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
+	dirPart: string,
+): string {
+	const parts: string[] = [];
+
+	if (files.length === 1) {
+		const s = summaries[0];
+		parts.push(`\`${s.file.relativePath}\` — ${generateFilePurpose(s.file, s.lang, s.exports)}.`);
+	} else {
+		parts.push(`${files.length} files in \`${dirPart || "root"}\`.`);
+
+		// Summarize the main responsibilities
+		const responsibilities = new Set<string>();
+		for (const s of summaries) {
+			const purpose = generateFilePurpose(s.file, s.lang, s.exports);
+			if (purpose.length > 10) responsibilities.add(purpose);
+		}
+		if (responsibilities.size > 0 && responsibilities.size <= 5) {
+			parts.push("Main responsibilities:");
+			for (const r of responsibilities) {
+				parts.push(`- ${r}`);
+			}
+		}
+	}
+
+	return parts.join("\n");
+}
+
+/** Extract key function signatures and patterns for architecture notes. */
+function extractArchitectureNotes(
+	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
+): string {
+	const notes: string[] = [];
+
+	for (const { file: f, lang, exports } of summaries) {
+		// Only extract from source code files
+		if (!lang.includes("TypeScript") && !lang.includes("JavaScript") && lang !== "Python") continue;
+
+		// Extract top-level function signatures (name + params, no body)
+		const funcSigs: string[] = [];
+		const funcPattern = /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/g;
+		let match: RegExpExecArray | null;
+		while ((match = funcPattern.exec(f.content)) !== null) {
+			const name = match[1];
+			const params = match[2].trim();
+			if (params.length > 60) continue; // Skip overly verbose signatures
+			funcSigs.push(`\`${name}(${params || ""})\``);
+		}
+
+		// Extract exported type/interface names
+		const typeExports: string[] = [];
+		const typePattern = /export\s+(?:type|interface)\s+(\w+)/g;
+		while ((match = typePattern.exec(f.content)) !== null) {
+			typeExports.push(match[1]);
+		}
+
+		if (funcSigs.length > 0 || typeExports.length > 0) {
+			const sigs = funcSigs.slice(0, 5).join(", ");
+			const types = typeExports.length > 0 ? `Types: ${typeExports.slice(0, 5).join(", ")}` : "";
+			notes.push(`**${f.relativePath}**: ${sigs}${types ? " | " + types : ""}`);
+		}
+	}
+
+	return notes.join("\n");
+}
+
+/** Generate agent usage instructions for a KB entry. */
+function generateAgentUsage(
+	category: KbCategory,
+	title: string,
+	summaries: { file: ScannedFile; lang: string; exports: string[] }[],
+	dirPart: string,
+): string {
+	const instructions: string[] = [];
+	instructions.push("> 🤖 **Agent guidance**: Consult this entry when you need to:");
+
+	switch (category) {
+		case "module":
+			instructions.push(`- Understand the implementation in \`${dirPart || "root"}\``);
+			instructions.push("- Find where a function or type is defined");
+			instructions.push("- Understand module dependencies and exports");
+			break;
+		case "api":
+			instructions.push("- Find API endpoints, routes, or handlers");
+			instructions.push("- Understand request/response patterns");
+			instructions.push("- Locate middleware or authentication logic");
+			break;
+		case "config":
+			instructions.push("- Check project configuration options");
+			instructions.push("- Understand build or tool settings");
+			break;
+		case "testing":
+			instructions.push("- Understand test coverage and patterns");
+			instructions.push("- Find test utilities or fixtures");
+			instructions.push("- Write new tests following existing patterns");
+			break;
+		case "build":
+			instructions.push("- Understand build scripts and dependencies");
+			instructions.push("- Modify package configuration");
+			break;
+		case "documentation":
+			instructions.push("- Find user-facing docs or README content");
+			instructions.push("- Understand project features or usage");
+			break;
+		case "data-model":
+			instructions.push("- Understand database schemas or data structures");
+			instructions.push("- Find model definitions or migrations");
+			break;
+		case "architecture":
+			instructions.push("- Understand high-level design decisions");
+			instructions.push("- Get an overview of system structure");
+			break;
+		default:
+			instructions.push(`- Look up details about the ${title} area`);
+			instructions.push("- Find file locations or configuration");
+			break;
+	}
+
+	return instructions.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -450,68 +616,69 @@ function generateEntry(
 		tags.add(f.extension.replace(".", "") || "plain");
 	}
 
-	// Build content sections
-	const sections: string[] = [];
-
-	// Overview
-	sections.push(`## Overview\n`);
-	sections.push(`This entry covers **${files.length} file(s)** in the \`${dirPart || "root"}\` directory.`);
-	sections.push("");
-
-	// File table
-	sections.push(`## Files\n`);
-	sections.push("| File | Lines | Language | Key Exports |");
-	sections.push("|------|-------|----------|-------------|");
-
+	// Collect all exports and imports across files
 	const allExports: string[] = [];
+	const allImports = new Set<string>();
+	const fileSummaries: { file: ScannedFile; lang: string; exports: string[] }[] = [];
+
 	for (const f of files) {
 		const lang = detectLanguage(f.extension);
 		const exports = extractExports(f.content, lang);
 		allExports.push(...exports);
-		const exportStr = exports.slice(0, 3).join(", ") || "—";
-		sections.push(`| \`${f.relativePath}\` | ${f.lines} | ${lang} | ${exportStr} |`);
+		fileSummaries.push({ file: f, lang, exports });
+		for (const imp of extractImports(f.content, lang)) {
+			if (!imp.startsWith(".")) allImports.add(imp);
+		}
+	}
+
+	// Build content sections — concise, AI-friendly format
+	const sections: string[] = [];
+
+	// Overview — AI-generated summary based on file analysis
+	sections.push("## Overview\n");
+	const overviewText = generateOverview(category, files, fileSummaries, dirPart);
+	sections.push(overviewText);
+	sections.push("");
+
+	// File table — compact reference
+	sections.push("## Files\n");
+	sections.push("| File | Lines | Purpose |");
+	sections.push("|------|-------|--------|");
+	for (const { file: f, lang, exports } of fileSummaries) {
+		const purpose = generateFilePurpose(f, lang, exports);
+		sections.push(`| \`${f.relativePath}\` | ${f.lines} | ${purpose} |`);
 	}
 	sections.push("");
 
-	// Key exports section
+	// Key exports (only if present)
 	const uniqueExports = [...new Set(allExports)];
 	if (uniqueExports.length > 0) {
 		sections.push("## Key Exports\n");
-		for (const exp of uniqueExports.slice(0, 15)) {
+		for (const exp of uniqueExports.slice(0, 10)) {
 			sections.push(`- \`${exp}\``);
 		}
 		sections.push("");
 	}
 
-	// Dependencies
-	const allImports = new Set<string>();
-	for (const f of files) {
-		const lang = detectLanguage(f.extension);
-		for (const imp of extractImports(f.content, lang)) {
-			if (!imp.startsWith(".")) allImports.add(imp);
-		}
-	}
+	// Dependencies (only external ones, compact)
 	if (allImports.size > 0) {
 		sections.push("## Dependencies\n");
-		for (const imp of [...allImports].slice(0, 15)) {
-			sections.push(`- \`${imp}\``);
-		}
+		sections.push([...allImports].slice(0, 10).map((imp) => `\`${imp}\``).join(", "));
 		sections.push("");
 	}
 
-	// Content (truncated)
-	if (config.includeContent) {
-		sections.push("## Source\n");
-		for (const f of files) {
-			if (f.lines <= 4) continue; // Skip tiny files
-			const lang = detectLanguage(f.extension);
-			const langTag = lang.toLowerCase().replace(/[^a-z]/g, "") || "text";
-			sections.push(`### \`${f.relativePath}\`\n`);
-			sections.push("```" + langTag);
-			sections.push(truncateContent(f.content, config.maxSourceLines));
-			sections.push("```\n");
-		}
+	// Architecture notes — extract function signatures and key patterns
+	const archNotes = extractArchitectureNotes(fileSummaries);
+	if (archNotes) {
+		sections.push("## Architecture\n");
+		sections.push(archNotes);
+		sections.push("");
 	}
+
+	// Agent usage instructions
+	sections.push("## When to Reference\n");
+	sections.push(generateAgentUsage(category, title, fileSummaries, dirPart));
+	sections.push("");
 
 	const content = sections.join("\n");
 
@@ -521,13 +688,11 @@ function generateEntry(
 		const lang = detectLanguage(f.extension);
 		const imports = extractImports(f.content, lang);
 		for (const imp of imports) {
-			if (imp.startsWith(".")) {
-				related.push(imp);
-			}
+			if (imp.startsWith(".")) related.push(imp);
 		}
 	}
 
-	// Description
+	// Description — concise, meaningful
 	const languages = new Set(files.map((f) => detectLanguage(f.extension)));
 	const langStr = [...languages].join(", ");
 	let description: string;
@@ -539,7 +704,7 @@ function generateEntry(
 		description = `${category} — ${files.length} files (${langStr}) in ${dirPart || "root"}`;
 	}
 
-	const filename = pathToFilename(groupKey.replace(":", "_")) + suffix + ".md";
+	const filename = pathToFilename(groupKey);
 
 	const frontmatter: KbEntryFrontmatter = {
 		title,
