@@ -14,6 +14,30 @@ Scans your codebase and creates a navigable `.kb/` folder of markdown documents 
 - ➕ **Manual additions** — Capture assistant output into the knowledge base
 - 🤖 **Auto-discovery** — The agent is automatically notified when a `.kb/` exists
 
+## Why Not Just Use AGENTS.md?
+
+Tools like `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` are great — they stuff project context into a single file that gets loaded into every request. But they hit a wall as projects grow:
+
+| | AGENTS.md | pi-md-knowledge |
+|---|---|---|
+| **Token cost** | Entire file sent every request | Agent fetches only matching entries on demand |
+| **Stays current** | Manual updates, drifts out of date | Auto-scans codebase, detects changes via git/hashes |
+| **Scalability** | One monolithic file grows unbounded | Many small, categorized entries stay bounded |
+| **Discoverability** | Agent must read the whole file to find anything | `kb_query` scores relevance and returns top matches |
+| **Secret safety** | You must remember not to paste secrets | Built-in redaction engine strips passwords, keys, tokens |
+| **Cross-references** | Flat text | Tags, related entries, source file links |
+| **Maintenance** | Hand-written | Auto-generated with `/md-knowledge update` |
+
+### The token problem
+
+A typical `AGENTS.md` for a mid-size project runs 2,000–5,000 tokens. That gets loaded into **every single request** — even a quick "fix this typo" pays the full context tax. At scale, you're either burning tokens on irrelevant context or starving the agent of information it actually needs.
+
+`pi-md-knowledge` flips the model: the agent gets a tiny "KB exists" hint (~50 tokens) and only pulls entries when it actually needs them via `kb_query`. A query for "authentication" returns just the auth module entry — maybe 300–500 tokens — instead of the entire project manifest.
+
+### Best of both worlds
+
+You don't have to choose. Keep `AGENTS.md` for high-level project conventions and coding style rules. Let `pi-md-knowledge` handle the heavy lifting of documenting every module, API, config, and data model in your codebase.
+
 ## Installation
 
 ```bash
